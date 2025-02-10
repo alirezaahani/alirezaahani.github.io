@@ -1,6 +1,6 @@
 :root {
     --accent: #008b8b;
-    --sans-font: Tahoma, "DejaVu Sans", helvetica, arial, freesans, sans-serif;
+    --sans-font: helvetica, arial, freesans, sans-serif;
 }
 
 .post-info time span {
