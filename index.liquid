@@ -13,7 +13,7 @@
         {% for post in collections.posts.pages %}
         <article>
           <h3><a href="{{ post.permalink }}">{{ post.title }}</a></h3>
-          <h4><time pubdate="pubdate">{{ post.published_date | date: "%Y/%m/%d" }}</time> - {% if post.categories.size > 0 %}{{ post.categories | join: ", " }}{% endif %}</h4>
+          <h4><time pubdate="pubdate">{{ post.published_date | date: "%Y/%m/%d" }}</time>{% if post.categories.size > 0 %} - {{ post.categories | join: ", " }}{% endif %}</h4>
           <p>
             {{ post.description }}
           </p>
