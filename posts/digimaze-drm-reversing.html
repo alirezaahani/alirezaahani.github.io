@@ -1,0 +1,716 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<meta charset="utf-8">
+<title>Alireza's blog :: Digimaze PDF DRM Reversing</title>
+<link rel="stylesheet" href="https://cdn.simplecss.org/simple.min.css">
+<link rel="stylesheet" href="/public/css/styles.css">
+<link rel="alternate" type="application/rss+xml" title="RSS Feed for Alireza's blog" href="https://alirezaahani.github.io/rss.xml" />
+    <meta name="description" content="Full offline recovery of per-book passwords from Digimaze PDF Reader - Dart/Flutter reversing with blutter, crypto layer mapping, and all the dead ends along the way">
+    <meta name="category" content="Technology, Reverse Engineering">
+  </head>
+  <body>
+    <header>
+      <h1>Alireza's blog</h1>
+<nav>
+    <a href="/">Index</a>
+    <a href="/pages/about.html">About</a>
+    <a href="https://github.com/alirezaahani">Github</a>
+    <a href="/rss.xml">RSS</a>
+</nav>
+
+    </header>
+    <main>
+      <article>
+        <div>  
+          <h2>Digimaze PDF DRM Reversing</h2>
+          <time pubdate="pubdate">Published at: 2026/08/25 01:11:09</time>
+          <span>- Category: Technology, Reverse Engineering</span> 
+        </div>
+        <p>Full offline recovery of per-book passwords from Digimaze PDF Reader - Dart/Flutter reversing with blutter, crypto layer mapping, and all the dead ends along the way</p>
+        <p class="notice" style="color: red">
+This post is for educational purposes only. The author does not endorse piracy or unauthorized access to copyrighted material.
+</p>
+<h3>Introduction</h3>
+<p>This is a follow-up to my earlier post about Digimaze PDF Reader. Last time, I found the password sitting in memory next to the PDF path - separated by three stars. That worked, but it felt like cheating, it was fixed by them :) . I wanted to understand <em>where</em> the password comes from, how it's derived, and whether the entire chain could be reproduced offline from files on disk.</p>
+<p>The answer turned out to be yes. This post documents everything: the toolchain, the wrong turns, the dead ends, and the final working script that takes a user's app data directory and spits out decryptable PDFs.</p>
+<p>The target is <strong>Digimaze PDF Reader</strong> (<code>com.vnegar.digimaze.reader</code>), available as a Windows UWP/MSIX app (version 1.1.114.0) and an Android APK (<code>Digimaze_PDF_Reader_V2.1.10.apk</code>). The interesting logic lives in Dart/Flutter - the Windows desktop build uses Flutter 2.21.1, the Android build uses Flutter 3.44.4 with Dart AOT compilation.</p>
+<p>The goal: recover the per-book password of standard-password-protected PDFs the app downloads, entirely offline.</p>
+<p>The outcome: <strong>success</strong>. The full chain is reproduced in one script (<code>digimaze_drm.py</code>), verified against real user data and validated with qpdf on an actual encrypted book.</p>
+<h3>Toolchain</h3>
+<p>Before diving in, here's what I used:</p>
+<table><thead><tr><th>Tool</th><th>Role</th><th>Notes</th></tr></thead><tbody>
+<tr><td><strong>Ghidra</strong></td><td>Static analysis of Windows PE binaries</td><td>Good for x86 PE with RTTI; useless on Dart AOT snapshots</td></tr>
+<tr><td><strong>blutter</strong> (worawit/blutter)</td><td>Dart AOT snapshot → annotated asm + class names</td><td><strong>Essential.</strong> Without this, libapp.so is opaque</td></tr>
+<tr><td><strong>qpdf</strong></td><td>PDF encryption inspection &amp; decryption</td><td><code>--show-encryption</code>, <code>--decrypt</code>, <code>--check</code></td></tr>
+<tr><td><strong>python3 + pycryptodome</strong></td><td>AES/CBC experiments</td><td>Debian package <code>python3-cryptodome</code>; module name <code>Cryptodome</code>, NOT <code>Crypto</code></td></tr>
+<tr><td><strong>DPAPI / CryptUnprotectData</strong></td><td>Decrypt flutter_secure_storage.dat</td><td>Must run as the same Windows user that ran the app</td></tr>
+<tr><td><strong>sqlite3</strong></td><td>Main app DB inspection</td><td>Plain SQLite, no encryption</td></tr>
+<tr><td><strong>readelf / xxd / file</strong></td><td>Quick triage of ELF/binary blobs</td><td>Standard binutils</td></tr>
+<tr><td><strong>fdfind</strong> (fd-find)</td><td>Locate app dirs on the Windows drive</td><td><code>apt install fd-find</code> provides <code>fdfind</code></td></tr>
+</tbody></table>
+<h4>Why Ghidra could not decompile libapp.so</h4>
+<p>Dart AOT snapshots are not normal machine code. Code lives inside a snapshot blob with Dart's own calling convention - arguments in specific registers, object pool references via a register. Function boundaries and names exist only in snapshot metadata tables that Ghidra's ELF loader doesn't parse. Strings ARE present but as pool objects referenced by offset from a thread-local &quot;object pool&quot; register (<code>x27</code> on arm64), not classic <code>.rodata</code>.</p>
+<p>The result in Ghidra: thousands of undifferentiated <code>FUN_xxxxxx</code> functions with no imports, no strings resolved, no calls resolved. Effectively unreadable.</p>
+<p>Blutter parses the snapshot header, walks the class/function tables, resolves object-pool constants, and emits pseudo-assembly annotated like:</p>
+<pre style="background-color:#2b303b;">
+<code><span style="color:#c0c5ce;">// 0xcdbed0: r16 = &quot;password&quot;
+</span><span style="color:#c0c5ce;">//     0xcdbed0: add             x16, PP, #0x1d, lsl #12  ; [pp+0x1d478] &quot;password&quot;
+</span></code></pre>
+<p>Every later finding hinged on this. <strong>Do not skip blutter.</strong></p>
+<h3>Phase 0 - Reconnaissance</h3>
+<h4>Locating the binaries</h4>
+<pre style="background-color:#2b303b;">
+<code><span style="color:#8fa1b3;">$</span><span style="color:#c0c5ce;"> ls </span><span style="color:#b48ead;">[</span><span style="color:#c0c5ce;">DRIVE</span><span style="color:#b48ead;">]</span><span style="color:#c0c5ce;">/&quot;</span><span style="color:#a3be8c;">Program Files</span><span style="color:#c0c5ce;">&quot;/WindowsApps/com.vnegar.digimaze.reader_1.1.114.0_x64__0qn9w5rgp5tx0/
+</span><span style="color:#8fa1b3;">RDPDFReader.exe</span><span style="color:#c0c5ce;">   RDPDFLIb.dll   RDPDFREADER.DLL   …
+</span></code></pre>
+<p>The Ghidra project listing first included three files: <code>RDPDFREADER.DLL</code>, <code>RDPDFLIb.dll</code>, and <code>RDPDFReader.exe</code>.</p>
+<p>Program info for RDPDFReader.dll showed:</p>
+<pre style="background-color:#2b303b;">
+<code><span style="color:#c0c5ce;">{&quot;</span><span style="color:#a3be8c;">executable_path</span><span style="color:#c0c5ce;">&quot;:&quot;</span><span style="color:#a3be8c;">…/com.vnegar.digimaze.reader_1.1.114.0_x64__0qn9w5rgp5tx0/RDPDFReader.dll</span><span style="color:#c0c5ce;">&quot;,
+</span><span style="color:#c0c5ce;"> &quot;</span><span style="color:#a3be8c;">image_base</span><span style="color:#c0c5ce;">&quot;:&quot;</span><span style="color:#a3be8c;">180000000</span><span style="color:#c0c5ce;">&quot;,&quot;</span><span style="color:#a3be8c;">function_count</span><span style="color:#c0c5ce;">&quot;:</span><span style="color:#d08770;">56939</span><span style="color:#c0c5ce;">,&quot;</span><span style="color:#a3be8c;">symbol_count</span><span style="color:#c0c5ce;">&quot;:</span><span style="color:#d08770;">335307</span><span style="color:#c0c5ce;">}
+</span></code></pre>
+<h4>Identifying the .NET shell vs native engine</h4>
+<p>Searching function names for crypto keywords in <code>RDPDFReader.dll</code> returned nothing useful directly, but string search revealed it's managed C#:</p>
+<pre style="background-color:#2b303b;">
+<code><span style="color:#c0c5ce;">&quot;ms-appx:///PDFMainPage/DlgPassword.xaml&quot;
+</span><span style="color:#c0c5ce;">&quot;RDPDFReader.Dialogs.DlgPassword&quot;
+</span><span style="color:#c0c5ce;">&quot;IPasswordBox&quot;, &quot;PasswordCredential&quot;
+</span><span style="color:#c0c5ce;">&quot;&lt;EncryptTextWithDefaultPassword&gt;&quot;, &quot;&lt;DecryptTextWithDefaultPassword&gt;&quot;
+</span><span style="color:#c0c5ce;">&quot;Windows.Security.Credentials.PasswordCredential&quot;
+</span></code></pre>
+<p>And branding:</p>
+<pre style="background-color:#2b303b;">
+<code><span style="color:#c0c5ce;">&quot;https://help.digimaze.org/pdf-reader-light&quot;
+</span><span style="color:#c0c5ce;">&quot;Digimaze_PDF_Reader.exe&quot;
+</span></code></pre>
+<p>Meanwhile <code>RDPDFLIb.dll</code> had full OpenSSL statically linked:</p>
+<pre style="background-color:#2b303b;">
+<code><span style="color:#c0c5ce;">&quot;AES-128-ECB&quot;, &quot;AES-256-CBC&quot;, &quot;id-aes128-wrap&quot;,
+</span><span style="color:#c0c5ce;">&quot;PBE-SHA1-RC4-128&quot;, &quot;RC4-HMAC-MD5&quot;,
+</span><span style="color:#c0c5ce;">&quot;unable to decrypt certificate&#39;s signature&quot;
+</span></code></pre>
+<p>…and RTTI typeinfo strings revealing PDFium-derived classes:</p>
+<pre style="background-color:#2b303b;">
+<code><span style="color:#c0c5ce;">.?AVCPDFEncrypt@@        @ 180460e20
+</span><span style="color:#c0c5ce;">.?AVCPDFEncryptStd@@     @ 180460e48
+</span><span style="color:#c0c5ce;">.?AVCPDFFuncIdentity@@   @ 180461d20
+</span></code></pre>
+<h4>Finding the standard-security-handler code</h4>
+<p>The canonical PDF padding constant (ISO 32000 §7.6.3):</p>
+<pre style="background-color:#2b303b;">
+<code><span style="color:#c0c5ce;">28 bf 4e 5e 4e 75 8a 41 64 00 4e 56 ff fa 01 08
+</span><span style="color:#c0c5ce;">2e 2e 00 b6 d0 68 3e 80 2f 0c a9 fe 64 53 69 7a
+</span></code></pre>
+<p>was found via byte-pattern search at <code>0x18035d6a8</code>, immediately before the <code>CPDFEncryptStd</code> vtable at <code>0x18035d6c8</code>. Ten cross-references to it all came from functions in <code>0x1800BA600–0x1800BB100</code> - the key derivation cluster.</p>
+<p>Decompiled <code>FUN_1800baa00</code> showed textbook Algorithm 3:</p>
+<pre style="background-color:#2b303b;">
+<code><span style="color:#b48ead;">if </span><span style="color:#c0c5ce;">(this-&gt;revision == </span><span style="color:#d08770;">2</span><span style="color:#c0c5ce;">) {
+</span><span style="color:#c0c5ce;">    </span><span style="color:#8fa1b3;">alg2</span><span style="color:#c0c5ce;">(this, pw); </span><span style="color:#8fa1b3;">rc4_ksa</span><span style="color:#c0c5ce;">(prga, key, len);
+</span><span style="color:#c0c5ce;">}
+</span><span style="color:#b48ead;">if </span><span style="color:#c0c5ce;">(this-&gt;revision &gt;= </span><span style="color:#d08770;">3 </span><span style="color:#c0c5ce;">&amp;&amp; this-&gt;revision &lt;= </span><span style="color:#d08770;">4</span><span style="color:#c0c5ce;">) {
+</span><span style="color:#c0c5ce;">    </span><span style="color:#8fa1b3;">md5_init</span><span style="color:#c0c5ce;">(&amp;ctx);
+</span><span style="color:#c0c5ce;">    </span><span style="color:#8fa1b3;">md5_update</span><span style="color:#c0c5ce;">(&amp;ctx, PAD_CONST, </span><span style="color:#d08770;">32</span><span style="color:#c0c5ce;">);          </span><span style="color:#65737e;">// ← our found constant
+</span><span style="color:#c0c5ce;">    </span><span style="color:#8fa1b3;">md5_update</span><span style="color:#c0c5ce;">(&amp;ctx, this-&gt;O_value, this-&gt;O_len);
+</span><span style="color:#c0c5ce;">    </span><span style="color:#8fa1b3;">md5_final</span><span style="color:#c0c5ce;">(&amp;ctx, digest);
+</span><span style="color:#c0c5ce;">    </span><span style="color:#8fa1b3;">rc4_ksa</span><span style="color:#c0c5ce;">(prga, key, len);
+</span><span style="color:#c0c5ce;">    </span><span style="color:#b48ead;">for </span><span style="color:#c0c5ce;">(i = </span><span style="color:#d08770;">1</span><span style="color:#c0c5ce;">; i &lt; </span><span style="color:#d08770;">20</span><span style="color:#c0c5ce;">; i++) {                 </span><span style="color:#65737e;">// 50 iterations? No-20.
+</span><span style="color:#c0c5ce;">        </span><span style="color:#b48ead;">for </span><span style="color:#c0c5ce;">(j = </span><span style="color:#d08770;">0</span><span style="color:#c0c5ce;">; j &lt; len; j++) key[j] ^= i; </span><span style="color:#65737e;">// XOR each byte with round #
+</span><span style="color:#c0c5ce;">        </span><span style="color:#8fa1b3;">md5</span><span style="color:#c0c5ce;">(key, len, digest);                  </span><span style="color:#65737e;">// re-hash
+</span><span style="color:#c0c5ce;">    }
+</span><span style="color:#c0c5ce;">    </span><span style="color:#65737e;">// AES key expansion follows for AESV2
+</span><span style="color:#c0c5ce;">}
+</span></code></pre>
+<p>Then <code>FUN_1800B93C0</code> = <code>CPDFEncryptStd::Init</code>:</p>
+<ul>
+<li>Reads <code>/Filter == &quot;Standard&quot;</code></li>
+<li>Parses <code>/V</code>, <code>/R</code>, <code>/Length</code>, <code>/O</code> (+0x68), <code>/U</code> (+0x78), <code>/P</code>, <code>/OE</code> (+0x90), <code>/UE</code> (+0x80), <code>/EncryptMetadata</code></li>
+<li>Detects cipher by CFM string: <code>&quot;V2&quot;</code> → RC4 mode 1, <code>&quot;AESV2&quot;</code> → mode 2, <code>&quot;AESV3&quot;</code> → mode 3</li>
+<li>Runs Algorithm 2 or 3 on the password, compares to <code>/O</code> and <code>/U</code></li>
+</ul>
+<p><strong>Conclusion:</strong> The native side implements only standard PDF encryption. Every non-standard thing happens in Dart, before the file reaches this library.</p>
+<h3>Phase 1 - Ghidra on the Windows PE binaries</h3>
+<p>I spent significant time here before realizing the real target was elsewhere. What I accomplished:</p>
+<ul>
+<li>Located <code>CPDFEncrypt</code>/<code>CPDFEncryptStd</code> vtables via typeinfo cross-references</li>
+<li>Identified OpenSSL static linkage from cipher-name strings</li>
+<li>Confirmed the engine is a PDFium fork (class naming convention)</li>
+<li>Decompiled the standard security handler init and key derivation</li>
+<li>Found <code>CRDSecMD5</code> (their MD5 wrapper class)</li>
+</ul>
+<p>What I did NOT find: any custom DRM layer, any per-book key storage, anything proprietary. The native side is standards-compliant.</p>
+<p><strong>Time wasted here:</strong> roughly half the session. The lesson: when an app has both a native engine AND a managed/Dart layer, check the Dart layer FIRST for custom logic. Native engines are usually stock libraries.</p>
+<h3>Phase 2 - Discovering the real target is Dart/Flutter</h3>
+<p>Laster I found out that the actual app is Dart compiled to <code>libapp.so</code>, I had already loaded it in Ghidra but it was undecompilable.</p>
+<p>Verification:</p>
+<pre style="background-color:#2b303b;">
+<code><span style="color:#8fa1b3;">$</span><span style="color:#c0c5ce;"> file libapp.so
+</span><span style="color:#8fa1b3;">arm64-v8a/libapp.so:</span><span style="color:#c0c5ce;"> ELF 64-bit LSB shared object, ARM aarch64, version 1 (SYSV)</span><span style="color:#8fa1b3;">,</span><span style="color:#c0c5ce;"> dynamically linked, BuildID</span><span style="color:#b48ead;">[</span><span style="color:#c0c5ce;">md5/uuid</span><span style="color:#b48ead;">]</span><span style="color:#c0c5ce;">=b71885091d005194f90d3cfa97d87501, stripped
+</span><span style="color:#c0c5ce;">
+</span><span style="color:#8fa1b3;">$</span><span style="color:#c0c5ce;"> readelf</span><span style="color:#bf616a;"> -h</span><span style="color:#c0c5ce;"> libapp.so
+</span><span style="color:#8fa1b3;">ELF</span><span style="color:#c0c5ce;"> Header:
+</span><span style="color:#c0c5ce;">  </span><span style="color:#8fa1b3;">Magic:</span><span style="color:#c0c5ce;">   7f 45 4c 46 02 01 01 00 00 00 00 00 00 00 00 00 
+</span><span style="color:#c0c5ce;">  </span><span style="color:#8fa1b3;">Class:</span><span style="color:#c0c5ce;">                             ELF64
+</span><span style="color:#c0c5ce;">  </span><span style="color:#8fa1b3;">Data:</span><span style="color:#c0c5ce;">                              2&#39;</span><span style="color:#a3be8c;">s complement, little endian
+</span><span style="color:#a3be8c;">  Version:                           1 (current)
+</span><span style="color:#a3be8c;">  OS/ABI:                            UNIX - System V
+</span><span style="color:#a3be8c;">  ABI Version:                       0
+</span><span style="color:#a3be8c;">  Type:                              DYN (Shared object file)
+</span><span style="color:#a3be8c;">  Machine:                           AArch64
+</span><span style="color:#a3be8c;">  Version:                           0x1
+</span><span style="color:#a3be8c;">  Entry point address:               0x0
+</span><span style="color:#a3be8c;">  Start of program headers:          64 (bytes into file)
+</span><span style="color:#a3be8c;">  Start of section headers:          19136720 (bytes into file)
+</span><span style="color:#a3be8c;">  Flags:                             0x0
+</span><span style="color:#a3be8c;">  Size of this header:               64 (bytes)
+</span><span style="color:#a3be8c;">  Size of program headers:           56 (bytes)
+</span><span style="color:#a3be8c;">  Number of program headers:         7
+</span><span style="color:#a3be8c;">  Size of section headers:           64 (bytes)
+</span><span style="color:#a3be8c;">  Number of section headers:         11
+</span><span style="color:#a3be8c;">  Section header string table index: 10
+</span></code></pre>
+<p>Strings leaked the Flutter version:</p>
+<pre style="background-color:#2b303b;">
+<code><span style="color:#8fa1b3;">$</span><span style="color:#c0c5ce;"> strings</span><span style="color:#bf616a;"> -n</span><span style="color:#c0c5ce;"> 20 libapp.so | </span><span style="color:#8fa1b3;">grep</span><span style="color:#bf616a;"> -iE </span><span style="color:#c0c5ce;">&quot;</span><span style="color:#a3be8c;">version</span><span style="color:#c0c5ce;">&quot; | </span><span style="color:#8fa1b3;">head
+</span><span style="color:#8fa1b3;">3.44.4</span><span style="color:#c0c5ce;"> (stable) </span><span style="color:#8fa1b3;">-</span><span style="color:#c0c5ce;"> Git hash ad70ec4617 - Git URL https://github.com/flutter/flutter.git
+</span><span style="color:#8fa1b3;">dart:convert/byte_conversion.dart
+</span><span style="color:#8fa1b3;">_getPlatformVersionStatus@1504418800
+</span><span style="color:#8fa1b3;">package:digimaze/domain/entities/version_status.dart
+</span></code></pre>
+<p>And package paths confirming the app structure:</p>
+<pre style="background-color:#2b303b;">
+<code><span style="color:#c0c5ce;">package:digimaze/domain/entities/version_status.dart
+</span><span style="color:#c0c5ce;">package:sentry/src/protocol/sdk_version.dart
+</span><span style="color:#c0c5ce;">Starting database upgrade to version 2
+</span><span style="color:#c0c5ce;">https://files.digimaze.org/Digimaze_PDF_Reader_V2.1.10.apk
+</span></code></pre>
+<h3>Phase 3 - Installing and running blutter</h3>
+<pre style="background-color:#2b303b;">
+<code><span style="color:#96b5b4;">cd</span><span style="color:#c0c5ce;"> /home/alireza/Desktop/digimaze
+</span><span style="color:#8fa1b3;">git</span><span style="color:#c0c5ce;"> clone https://github.com/worawit/blutter
+</span><span style="color:#8fa1b3;">python3</span><span style="color:#c0c5ce;"> blutter/blutter.py arm64-v8a/ digimaze-blutter-output
+</span></code></pre>
+<p>The output structure:</p>
+<pre style="background-color:#2b303b;">
+<code><span style="color:#c0c5ce;">digimaze-blutter-output/
+</span><span style="color:#c0c5ce;">├── asm/
+</span><span style="color:#c0c5ce;">│   ├── digimaze/                    ← the app&#39;s own code
+</span><span style="color:#c0c5ce;">│   │   ├── core/common/utils/encryption.dart
+</span><span style="color:#c0c5ce;">│   │   ├── data/repository/impl/book_repo.dart
+</span><span style="color:#c0c5ce;">│   │   ├── presentation/pages/book/widgets/general_book/utils/pdf_reader/
+</span><span style="color:#c0c5ce;">│   │   │   ├── base_pdf_reader_utils.dart
+</span><span style="color:#c0c5ce;">│   │   │   ├── lagacy_pdf_reader_utils.dart
+</span><span style="color:#c0c5ce;">│   │   │   └── adavnced_pdf_reader_utils.dart   (typo theirs, not ours)
+</span><span style="color:#c0c5ce;">│   │   └── ...
+</span><span style="color:#c0c5ce;">│   ├── encrypt/                     ← third-party pub packages
+</span><span style="color:#c0c5ce;">│   ├── cryptography/
+</span><span style="color:#c0c5ce;">│   ├── sqflite_common/
+</span><span style="color:#c0c5ce;">│   └── ...147 package dirs total
+</span><span style="color:#c0c5ce;">├── ida_script/
+</span><span style="color:#c0c5ce;">├── blutter_frida.js                 675K
+</span><span style="color:#c0c5ce;">├── objs.txt                         1.8M
+</span><span style="color:#c0c5ce;">└── pp.txt                           4.1M   (object pool dump)
+</span></code></pre>
+<p>Each <code>.dart</code> file contains pseudo-assembly with resolved names, source-line comments, and object-pool annotations. Here's a sample showing how readable it becomes:</p>
+<pre style="background-color:#2b303b;">
+<code><span style="color:#c0c5ce;">// 0xcab23c: r1 = Instance_Base64Codec
+</span><span style="color:#c0c5ce;">//     0xcab23c: ldr             x1, [PP, #0x1150]  ; [pp+0x1150] Obj!Base64Codec@10e33f1
+</span><span style="color:#c0c5ce;">// 0xcab240: r0 = decode()
+</span><span style="color:#c0c5ce;">//     0xcab240: bl              #0x10ab7dc  ; [dart:convert] Base64Codec::decode
+</span><span style="color:#c0c5ce;">// 0xcab248: r0 = Encrypted()
+</span><span style="color:#c0c5ce;">//     0xcab248: bl              #0xcab4dc  ; AllocateEncryptedStub -&gt; Encrypted (size=0xc)
+</span></code></pre>
+<h3>Phase 4 - Mapping the crypto layers</h3>
+<h4>Finding the encryption utility class</h4>
+<pre style="background-color:#2b303b;">
+<code><span style="color:#8fa1b3;">$</span><span style="color:#c0c5ce;"> grep</span><span style="color:#bf616a;"> -rln -iE </span><span style="color:#c0c5ce;">&quot;</span><span style="color:#a3be8c;">decrypt|aes|rc4|cipher</span><span style="color:#c0c5ce;">&quot; digimaze encrypt
+</span><span style="color:#8fa1b3;">digimaze/core/common/utils/encryption.dart
+</span><span style="color:#8fa1b3;">digimaze/presentation/utils/security.dart
+</span><span style="color:#8fa1b3;">encrypt/encrypt.dart</span><span style="color:#c0c5ce;">                       ← pub package &quot;</span><span style="color:#a3be8c;">encrypt</span><span style="color:#c0c5ce;">&quot;
+</span><span style="color:#8fa1b3;">cryptography/src/dart/aes_cbc.dart</span><span style="color:#c0c5ce;">         ← pub package &quot;</span><span style="color:#a3be8c;">cryptography</span><span style="color:#c0c5ce;">&quot;
+</span></code></pre>
+<p>The main file <code>encryption.dart</code> defines:</p>
+<pre style="background-color:#2b303b;">
+<code><span style="color:#c0c5ce;">class EncryptionParams extends Object {}          // class id 4641, size 0x18
+</span><span style="color:#c0c5ce;">class Encryption extends Object {                  // class id 4642, size 0x8
+</span><span style="color:#c0c5ce;">  Future&lt;String&gt;      decryptText(ct, keyStr, ivSeed)          @ 0xca6a84
+</span><span style="color:#c0c5ce;">  Future&lt;Uint8List&gt;   decryptBinaryText(data, keyStr, ivSeed)  @ 0xca9b2c
+</span><span style="color:#c0c5ce;">  Future&lt;String&gt;      encryptText(plain, keyStr)               @ 0xcd3118
+</span><span style="color:#c0c5ce;">  Future&lt;bool&gt;        decryptFile(srcPath, dstPath, keyStr, ivSeed, ?) @ 0xd27a54
+</span><span style="color:#c0c5ce;">  String              utf8ToHex(String s, {bool havePadding})   @ 0xca8f68
+</span><span style="color:#c0c5ce;">}
+</span></code></pre>
+<h4>Decoding <code>utf8ToHex</code> (addr <code>0xca8f68</code>)</h4>
+<p>From the asm, I reconstructed the algorithm:</p>
+<pre style="background-color:#2b303b;">
+<code><span style="color:#b48ead;">def </span><span style="color:#8fa1b3;">utf8ToHex</span><span style="color:#c0c5ce;">(</span><span style="color:#bf616a;">s</span><span style="color:#c0c5ce;">, </span><span style="color:#bf616a;">havePadding</span><span style="color:#c0c5ce;">=</span><span style="color:#d08770;">False</span><span style="color:#c0c5ce;">):
+</span><span style="color:#c0c5ce;">    out = &#39;&#39;
+</span><span style="color:#c0c5ce;">    </span><span style="color:#b48ead;">for </span><span style="color:#c0c5ce;">ch </span><span style="color:#b48ead;">in </span><span style="color:#c0c5ce;">s:
+</span><span style="color:#c0c5ce;">        h = ch.</span><span style="color:#8fa1b3;">encode</span><span style="color:#c0c5ce;">(&#39;</span><span style="color:#a3be8c;">utf-8</span><span style="color:#c0c5ce;">&#39;).</span><span style="color:#8fa1b3;">hex</span><span style="color:#c0c5ce;">()       </span><span style="color:#65737e;"># bytes → hex
+</span><span style="color:#c0c5ce;">        </span><span style="color:#b48ead;">if </span><span style="color:#c0c5ce;">havePadding and </span><span style="color:#96b5b4;">len</span><span style="color:#c0c5ce;">(h) == </span><span style="color:#d08770;">2</span><span style="color:#c0c5ce;">:
+</span><span style="color:#c0c5ce;">            h = &#39;</span><span style="color:#a3be8c;">00</span><span style="color:#c0c5ce;">&#39; + h                   </span><span style="color:#65737e;"># pad single-byte chars to 4 hex digits
+</span><span style="color:#c0c5ce;">        out += h
+</span><span style="color:#c0c5ce;">    </span><span style="color:#b48ead;">return </span><span style="color:#c0c5ce;">out
+</span></code></pre>
+<p>Key evidence from the asm (trimmed):</p>
+<pre style="background-color:#2b303b;">
+<code><span style="color:#c0c5ce;">// 0xca9044: r1 = Instance_Utf8Encoder
+</span><span style="color:#c0c5ce;">//     0xca9044: ldr             x1, [PP, #0xff0]  ; [pp+0xff0] Obj!Utf8Encoder@10e34d1
+</span><span style="color:#c0c5ce;">// 0xca904c: r0 = convert()
+</span><span style="color:#c0c5ce;">//     0xca904c: bl              #0x10b8674  ; [dart:convert] Utf8Encoder::convert
+</span><span style="color:#c0c5ce;">// 0xca9054: r1 = Instance_HexEncoder
+</span><span style="color:#c0c5ce;">//     0xca9054: add             x1, PP, #0x18, lsl #12  ; [pp+0x184c8] Obj!HexEncoder@10e3481
+</span><span style="color:#c0c5ce;">// 0xca905c: r0 = convert()
+</span><span style="color:#c0c5ce;">//     0xca905c: bl              #0x10b9904  ; [package:convert/src/hex/encoder.dart] HexEncoder::convert
+</span><span style="color:#c0c5ce;">// 0xca9068: cmp             w1, #4              ; hex length == 4?
+</span><span style="color:#c0c5ce;">// 0xca9074: tbnz            w3, #4, #0xca90a4   ; havePadding branch
+</span><span style="color:#c0c5ce;">// 0xca9084: r16 = &quot;00&quot;                          ; the pad prefix
+</span></code></pre>
+<p>Examples:</p>
+<ul>
+<li><code>'A'</code> no-pad → <code>&quot;41&quot;</code>, padded → <code>&quot;0041&quot;</code></li>
+<li><code>'ع'</code> (U+0639, UTF-8 <code>d8 b9</code>) → <code>&quot;d8b9&quot;</code> regardless of padding flag</li>
+</ul>
+<h4>Decoding <code>decryptText</code> (addr <code>0xca6a84</code>)</h4>
+<p>Setup parameters show THREE arguments beyond <code>this</code>:</p>
+<pre style="background-color:#2b303b;">
+<code><span style="color:#c0c5ce;">// 0xca6a90: SetupParameters(Encryption this /* r1 =&gt; r4, fp-0xb0 */,
+</span><span style="color:#c0c5ce;">//                             dynamic _ /* r2 =&gt; r3, fp-0xc8 */,    ← ct
+</span><span style="color:#c0c5ce;">//                             dynamic _ /* r3 =&gt; r2, fp-0xc0 */)    ← keyStr
+</span><span style="color:#c0c5ce;">// then later x5 (4th arg) → ivSeed
+</span></code></pre>
+<p>Body flow (from asm, condensed):</p>
+<pre style="background-color:#2b303b;">
+<code><span style="color:#c0c5ce;">1. keyMaterial = utf8ToHex(&quot;11111&quot; + keyArg.substring(0,22))
+</span><span style="color:#c0c5ce;">                NO padding flag here
+</span><span style="color:#c0c5ce;">2. keyBytes   = Utf8Encoder.convert(keyMaterial)      ← ascii of hex STRING
+</span><span style="color:#c0c5ce;">3. secretKey  = newSecretKeyFromBytes(keyBytes)       ← DartAesCbc.secretKeyLength=32
+</span><span style="color:#c0c5ce;">4. ivSeed     = ctArg.substring(0, 8)                 ← FIRST 8 CHARS OF CT STRING
+</span><span style="color:#c0c5ce;">5. ivBytes    = Utf8Encoder.convert(utf8ToHex(ivSeed, havePadding:true))
+</span><span style="color:#c0c5ce;">6. plain      = DartAesCbc.decrypt(SecretBox(key, iv), base64Decode(ct))
+</span><span style="color:#c0c5ce;">7. return     = utf8.decode(plain)
+</span></code></pre>
+<p>The critical detail confirmed by finding the literal in the pool:</p>
+<pre style="background-color:#2b303b;">
+<code><span style="color:#c0c5ce;">// 0xca6b28: r16 = &quot;11111&quot;
+</span><span style="color:#c0c5ce;">//     0xca6b28: add             x16, PP, #0x18, lsl #12  ; [pp+0x183d0] &quot;11111&quot;
+</span><span style="color:#c0c5ce;">// 0xca6b34: r16 = 22                            ; substring length
+</span><span style="color:#c0c5ce;">// 0xca6bbc: r0 = substring()                    ; on ctArg? No-on KEY arg
+</span></code></pre>
+<p>Careful reading shows <code>substring(0,22)</code> is applied to <code>fp-0xc0</code> which is the KEY argument (arg3), not the ct. The <code>&quot;11111&quot;</code> gets prepended to the KEY, not the IV. This distinction cost me hours.</p>
+<h4>The three call sites and where their args come from</h4>
+<p><strong>Call site A: <code>decryptText(user_drm_info_ct, phone, name)</code></strong></p>
+<p>Found in <code>StorageRepository::getUserDrm</code> (<code>0xca6478</code>):</p>
+<pre style="background-color:#2b303b;">
+<code><span style="color:#c0c5ce;">// 0xca6818: r0 = getUser()
+</span><span style="color:#c0c5ce;">//     0xca6818: bl  #0x75f86c  ; LocalPref::getUser
+</span><span style="color:#c0c5ce;">// 0xca6834: LoadField: r1 = r0-&gt;field_f        ← repository field_f
+</span><span style="color:#c0c5ce;">// 0xca683c: LoadField: r3 = r1-&gt;field_13       ← UserModel.field_13 = PHONE
+</span><span style="color:#c0c5ce;">// 0xca6844: mov x1, x3                          ← becomes arg2 (keyStr)
+</span><span style="color:#c0c5ce;">// 0xca6848: r0 = getUserDrmInfo()               ← returns stored b64 ct
+</span><span style="color:#c0c5ce;">//     0xca6848: bl  #0xca69f0  ; LocalPref::getUserDrmInfo
+</span><span style="color:#c0c5ce;">// 0xca6874: LoadField: r3 = r0-&gt;field_13        ← ??? field on result?
+</span><span style="color:#c0c5ce;">// 0xca6880: LoadField: r5 = r0-&gt;field_1b        ← ???
+</span></code></pre>
+<p>This was confusing because <code>getUserDrmInfo()</code> returns <code>Future&lt;String?&gt;</code> per its own signature, yet the code reads <code>.field_13</code> off it. The resolution: those LoadFields are actually operating on the USER object still in flight, not on the string result. Blutter mis-attributes some loads across await boundaries. The net effect after disentangling:</p>
+<pre style="background-color:#2b303b;">
+<code><span style="color:#c0c5ce;">decryptText(ct=stored_user_drm_info, key=user.phone, ivSeed=user.name[:8])
+</span></code></pre>
+<p>This was verified empirically once implemented (see the successful chain section).</p>
+<p><strong>Call site B: <code>decryptBinaryText(backup_bytes, drmJson.key, drmJson.iv)</code></strong></p>
+<p>In <code>BookRepository::getBookPassword</code> closure (<code>0xca9e5c</code>):</p>
+<pre style="background-color:#2b303b;">
+<code><span style="color:#c0c5ce;">// 0xca9f04: r0 = setBookEncryptedPassword()
+</span><span style="color:#c0c5ce;">// args: x2 = raw downloaded bytes, x3 = drm.key, x5 = drm.iv
+</span></code></pre>
+<p>Where <code>drm</code> comes from step A's decrypted JSON.</p>
+<p><strong>Call site C: <code>decryptFile(srcPath, dstPath, keyStr, ivSeed, ?)</code> @ <code>0xd27a54</code></strong></p>
+<p>Used for outer-layer decryption of downloaded attachments. Same structure as B.</p>
+<h4>Locating the backup download</h4>
+<p><code>Downloader::downloadBookFileConfig</code> @ <code>0xca94dc</code>:</p>
+<pre style="background-color:#2b303b;">
+<code><span style="color:#c0c5ce;">// 0xca9548: r2 = &quot;BASE_URL&quot;
+</span><span style="color:#c0c5ce;">// 0xca9594: r16 = &quot;/storage/v3/books/&quot;
+</span><span style="color:#c0c5ce;">// 0xca95bc: r16 = &quot;/file/backup&quot;
+</span><span style="color:#c0c5ce;">// 0xca95f8: r16 = &quot;Authorization&quot;
+</span><span style="color:#c0c5ce;">// → GET {BASE_URL}/storage/v3/books/{bookId}/file/backup
+</span></code></pre>
+<p>The response body is 48 raw bytes - one AES block payload plus one block PKCS7 padding. It's saved locally as <code>backup_&lt;bookId&gt;.time</code>.</p>
+<h4>Where the PDF password actually goes</h4>
+<p><code>AdvancedPdfReaderUtils::_prepareSecureParams</code> (<code>0xca9ff0</code>):</p>
+<ol>
+<li>Calls <code>GetBookPassword::call(bookId)</code> → returns 32-char password</li>
+<li>Calls <code>BasePdfReaderUtils::getPasswordKey(true)</code> → static transport key</li>
+<li>Calls <code>Encryption::encryptObfuscatedParams(...)</code> which:
+<ul>
+<li>Generates 5 random 8-char strings</li>
+<li>Obfuscates them with PositionObfuscator</li>
+<li>Encrypts with <code>encryptText</code></li>
+</ul>
+</li>
+<li>Sends over MethodChannel <code>&quot;openBook&quot;</code> with <code>{path, params}</code></li>
+</ol>
+<p>The native mupdf plugin receives, de-obfuscates, and opens the PDF with the password.</p>
+<p>The legacy path (<code>lagacy_pdf_reader_utils.dart</code> @ <code>0xcdbd48</code>):
+MethodChannel <code>&quot;open&quot;</code> with map <code>{path, bookId, password}</code> - password sent as <code>encryptText(getPasswordKey())</code>.</p>
+<p>Neither channel carries the actual PDF password in plaintext over the wire; it's always wrapped in the transport layer first.</p>
+<h3>Dead ends and wrong assumptions</h3>
+<p>This section documents everything I tried that didn't work, why, and what I learned.</p>
+<h4>Dead end 1: Static password tables unlock the PDFs</h4>
+<p><strong>What I found:</strong> In <code>BasePdfReaderUtils::getPasswordKey</code> (<code>0xcd5b74</code>), two hardcoded arrays selected by argument bit #4:</p>
+<pre style="background-color:#2b303b;">
+<code><span style="color:#c0c5ce;">Branch A: [94,204,88,168,212,182,248,100,104,146,176,110,214,240,154,104]
+</span><span style="color:#c0c5ce;">Branch B: [198,162,114,130,252,124,112,86,150,116,158,254,216,118,212,244]
+</span></code></pre>
+<p>A closure at <code>0xcd5d84</code> applies <code>byte ^ 8</code> to each element, then UTF-8-decodes.</p>
+<p><strong>What I computed:</strong></p>
+<pre style="background-color:#2b303b;">
+<code><span style="color:#c0c5ce;">&gt;&gt;&gt; bytes((x&gt;&gt;</span><span style="color:#d08770;">1</span><span style="color:#c0c5ce;">)^</span><span style="color:#d08770;">8 </span><span style="color:#b48ead;">for </span><span style="color:#c0c5ce;">x </span><span style="color:#b48ead;">in </span><span style="color:#c0c5ce;">A)   </span><span style="color:#65737e;"># account for Smi tagging then xor
+</span><span style="color:#b48ead;">b</span><span style="color:#c0c5ce;">&quot;</span><span style="color:#a3be8c;">&#39;n$</span><span style="color:#96b5b4;">\\</span><span style="color:#a3be8c;">x08St:&lt;AP?cpE&lt;</span><span style="color:#c0c5ce;">&quot;
+</span><span style="color:#c0c5ce;">
+</span><span style="color:#c0c5ce;">&gt;&gt;&gt; bytes((x&gt;&gt;</span><span style="color:#d08770;">1</span><span style="color:#c0c5ce;">)^</span><span style="color:#d08770;">8 </span><span style="color:#b48ead;">for </span><span style="color:#c0c5ce;">x </span><span style="color:#b48ead;">in </span><span style="color:#c0c5ce;">B)
+</span><span style="color:#b48ead;">b</span><span style="color:#c0c5ce;">&#39;</span><span style="color:#a3be8c;">kY1Iv60#C2Gwd3br</span><span style="color:#c0c5ce;">&#39;              </span><span style="color:#65737e;"># clean printable!
+</span></code></pre>
+<p><strong>What I assumed:</strong> Branch B looks like a proper random password. It must be THE password. I tested it against <code>attachment_1060_….pdf</code>:</p>
+<pre style="background-color:#2b303b;">
+<code><span style="color:#8fa1b3;">$</span><span style="color:#c0c5ce;"> qpdf</span><span style="color:#bf616a;"> --show-encryption --password</span><span style="color:#c0c5ce;">=kY1Iv60#C2Gwd3br attachment_1060_….pdf
+</span><span style="color:#8fa1b3;">Incorrect</span><span style="color:#c0c5ce;"> password supplied
+</span><span style="color:#8fa1b3;">R</span><span style="color:#c0c5ce;"> = 5
+</span><span style="color:#8fa1b3;">P</span><span style="color:#c0c5ce;"> =</span><span style="color:#bf616a;"> -3904
+</span></code></pre>
+<p>Also tried Branch A, both without the <code>&gt;&gt;1</code> shift, both without XOR, and multiple combinations. All failed.</p>
+<p><strong>Why I was wrong:</strong> These arrays feed <code>encryptObfuscatedParams</code> - they're transport keys between Dart UI and native plugin over MethodChannel. They never touch the PDF file itself. They're also used as fallback key material for other features.</p>
+<p><strong>Lesson:</strong> A clean printable string appearing after decoding feels like a win. It was a decoy. Always trace where a candidate value is consumed before celebrating.</p>
+<h4>Dead end 2: &quot;The DRM key is in shared_preferences.json&quot;</h4>
+<p>I grepped every key. Contents include <code>flutter.user_v2</code> (full profile JSON with id=334934, phone, name, major, grade, province), <code>auth_token_v2</code>, <code>refresh_token_v2</code>, feature flags, SMS templates. No DRM material anywhere.</p>
+<h4>Dead end 3: &quot;The DRM key is in the JWT&quot;</h4>
+<p>Decoded <code>auth_token_v2</code> payload:</p>
+<pre style="background-color:#2b303b;">
+<code><span style="color:#c0c5ce;">{&quot;</span><span style="color:#a3be8c;">sub</span><span style="color:#c0c5ce;">&quot;:</span><span style="color:#d08770;">564935</span><span style="color:#c0c5ce;">, &quot;</span><span style="color:#a3be8c;">phone</span><span style="color:#c0c5ce;">&quot;:&quot;</span><span style="color:#a3be8c;">[REDACTED]</span><span style="color:#c0c5ce;">&quot;, &quot;</span><span style="color:#a3be8c;">device</span><span style="color:#c0c5ce;">&quot;:&quot;</span><span style="color:#a3be8c;">WINDOWS</span><span style="color:#c0c5ce;">&quot;,
+</span><span style="color:#c0c5ce;"> &quot;</span><span style="color:#a3be8c;">deviceId</span><span style="color:#c0c5ce;">&quot;:</span><span style="color:#d08770;">194369</span><span style="color:#c0c5ce;">, &quot;</span><span style="color:#a3be8c;">iat</span><span style="color:#c0c5ce;">&quot;:</span><span style="color:#d08770;">1776779369</span><span style="color:#c0c5ce;">, &quot;</span><span style="color:#a3be8c;">exp</span><span style="color:#c0c5ce;">&quot;:</span><span style="color:#d08770;">1779371369</span><span style="color:#c0c5ce;">}
+</span></code></pre>
+<p>I tried each claim as key material with multiple derivation variants (raw, SHA-256, hex-encoded). None produced valid plaintext.</p>
+<p>The reason: the DRM info comes from a separate server endpoint (<code>/v2/user/books/info</code>) and is stored encrypted with a phone-derived key. The JWT is unrelated to DRM.</p>
+<h4>Dead end 4: &quot;IV comes from the ciphertext&quot; (partially wrong)</h4>
+<p>For <code>decryptBinaryText</code> on binary files (like <code>backup_*.time</code>), yes - the IV derivation uses the ciphertext. But for <code>decryptText</code> when called from <code>getUserDrm</code>, the IV argument is the user's NAME, passed separately as the 4th positional parameter.</p>
+<p>Mixing these up produced output where blocks 2..N decoded cleanly but block 1 was garbage. In CBC mode, a wrong IV corrupts exactly one block (the first) - which made it look like &quot;almost working&quot;.</p>
+<p>Symptom example (wrong IV variant):</p>
+<pre style="background-color:#2b303b;">
+<code><span style="color:#c0c5ce;">b&#39;/*:h-+6udj&gt;fcic3-80ea-4c01-b0cc-4b7f08994312&quot;,&quot;i&#39;
+</span><span style="color:#c0c5ce;">                                  ^^^^^^^^^^^^^^^^ blocks 2+ perfect
+</span><span style="color:#c0c5ce;">^^^^^^^^^^^^^^^^^^ block 1 garbage
+</span></code></pre>
+<p>Once I realized block 1 should start with <code>{&quot;key&quot;:&quot;</code> (JSON opening), I could do known-plaintext recovery of the correct IV:</p>
+<pre style="background-color:#2b303b;">
+<code><span style="color:#65737e;"># required_iv = AES_ECB_decrypt(key, ct_block1) XOR known_plain_block1
+</span><span style="color:#65737e;"># required_iv[0:8] = &#39;d8b9d984&#39;  ← ASCII, matching u8hex(name[:8],pad=True)[:8]
+</span></code></pre>
+<p>That pinned down the correct IV source: the NAME, padded-hex-encoded.</p>
+<p><strong>Lesson:</strong> In CBC, garbage limited to block 1 means your KEY is right and your IV is wrong. Don't throw away the key.</p>
+<h4>Dead end 5: &quot;utf8ToHex always pads&quot;</h4>
+<p>Nope. The named <code>havePadding</code> argument controls whether single-byte chars get <code>&quot;00&quot;</code> prefix. Different call sites pass different values:</p>
+<ul>
+<li>Key derivation sites: NO padding (each ascii char contributes 2 hex chars)</li>
+<li>IV derivation sites: YES padding (each char contributes exactly 4 hex chars)</li>
+</ul>
+<p>Getting this wrong also corrupts exactly the first block (since only IV length changes, not the key schedule). Same symptom as dead end 4.</p>
+<h4>Attempt: brute-force guessing the missing GUID chars</h4>
+<p>After getting blocks 2..N clean, I briefly considered brute-forcing the missing 9 leading characters of the GUID in block 1. Pointless - once the correct IV was identified, everything decoded cleanly. Never brute-force what you can derive.</p>
+<h4>Misreading blutter output across async boundaries</h4>
+<p>Several times I saw <code>LoadField: rX = rY-&gt;field_NN</code> applied to what appeared to be a String return value. Strings don't have fields. What was actually happening: blutter attributes loads across <code>await</code> boundaries imprecisely, and the load was really hitting the USER object captured in the closure scope, not the freshly-returned string.</p>
+<p>The fix: trace register lifetimes manually through the <code>AwaitStub</code> calls rather than trusting variable-to-variable attribution.</p>
+<h3>The successful chain, end to end with real outputs</h3>
+<p>Inputs needed:</p>
+<ol>
+<li><code>shared_preferences.json</code> - for <code>flutter.user_v2.phone</code> (key seed) and <code>.name</code> (IV seed)</li>
+<li><code>flutter_secure_storage.dat</code> - DPAPI blob containing <code>user_drm_info</code></li>
+<li>One or more <code>backup_&lt;bookId&gt;.time</code> files</li>
+</ol>
+<p>All paths are relative to <code>%APPDATA%\com.vnegar\digimaze\</code> on Windows, or the copied equivalent on Linux.</p>
+<h4>Step 1 - Unprotect the secure storage</h4>
+<p>Verify it's DPAPI:</p>
+<pre style="background-color:#2b303b;">
+<code><span style="color:#8fa1b3;">$</span><span style="color:#c0c5ce;"> xxd flutter_secure_storage.dat | </span><span style="color:#8fa1b3;">head</span><span style="color:#bf616a;"> -3
+</span><span style="color:#8fa1b3;">00000000:</span><span style="color:#c0c5ce;"> 0100 0000 d08c 9ddf 0115 d111 8c7a 00c0  .............z..
+</span><span style="color:#8fa1b3;">00000010:</span><span style="color:#c0c5ce;"> 4fc2 97eb 0100 0000 6036 445b 8b7c 6547  O.......`</span><span style="color:#8fa1b3;">6D[.</span><span style="color:#c0c5ce;">|</span><span style="color:#8fa1b3;">eG
+</span></code></pre>
+<p>Magic <code>01 00 00 00 D0 8C 9D DF</code> = CRYPTPROTECTPROTECTED structure.</p>
+<p>Decrypt on Windows (same user):</p>
+<pre style="background-color:#2b303b;">
+<code><span style="color:#c0c5ce;">Add-Type -AssemblyName System.Security
+</span><span style="color:#c0c5ce;">$b = [IO.File]::ReadAllBytes(&quot;$env:APPDATA\com.vnegar\digimaze\flutter_secure_storage.dat&quot;)
+</span><span style="color:#c0c5ce;">[Text.Encoding]::UTF8.GetString(
+</span><span style="color:#c0c5ce;">  [Security.Cryptography.ProtectedData]::Unprotect(
+</span><span style="color:#c0c5ce;">    $b, $null, [System.Security.Cryptography.DataProtectionScope]::CurrentUser))
+</span></code></pre>
+<p><strong>Gotcha:</strong> passing the string <code>&quot;CurrentUserScope&quot;</code> fails type conversion. You must use <code>[DataProtectionScope]::CurrentUser</code> explicitly.</p>
+<p>Real output:</p>
+<pre style="background-color:#2b303b;">
+<code><span style="color:#c0c5ce;">{&quot;</span><span style="color:#a3be8c;">last_read_book</span><span style="color:#c0c5ce;">&quot;:&quot;</span><span style="color:#a3be8c;">1279</span><span style="color:#c0c5ce;">&quot;,
+</span><span style="color:#c0c5ce;"> &quot;</span><span style="color:#a3be8c;">user_drm_info</span><span style="color:#c0c5ce;">&quot;:&quot;</span><span style="color:#a3be8c;">4LQb/8gjnDPE3D7fOtcxOH+DlMcgNWp8rTeAN4Mb6DauRp0O6DNlvpmQgWAWlg6GHM6YqHZHl9P55FLl2SBhMb8qX2Au16cYdbbx6ZYMLpL3uDCfmvZeJb+zCrE/KKLx</span><span style="color:#c0c5ce;">&quot;}
+</span></code></pre>
+<h4>Step 2 - Decrypt user_drm_info</h4>
+<p>From <code>shared_preferences.json</code>:</p>
+<pre style="background-color:#2b303b;">
+<code><span style="color:#c0c5ce;">&quot;</span><span style="color:#a3be8c;">flutter.user_v2</span><span style="color:#c0c5ce;">&quot;: {&quot;</span><span style="color:#a3be8c;">id</span><span style="color:#c0c5ce;">&quot;:</span><span style="color:#d08770;">334934</span><span style="color:#c0c5ce;">, &quot;</span><span style="color:#a3be8c;">phone</span><span style="color:#c0c5ce;">&quot;:&quot;</span><span style="color:#a3be8c;">[REDACTED]</span><span style="color:#c0c5ce;">&quot;,
+</span><span style="color:#c0c5ce;">                    &quot;</span><span style="color:#a3be8c;">name</span><span style="color:#c0c5ce;">&quot;:&quot;</span><span style="color:#a3be8c;">علیرضا آهنی</span><span style="color:#c0c5ce;">&quot;, </span><span style="background-color:#bf616a;color:#2b303b;">...</span><span style="color:#c0c5ce;">}
+</span></code></pre>
+<p>Python implementation (final version from <code>digimaze_drm.py</code>):</p>
+<pre style="background-color:#2b303b;">
+<code><span style="color:#b48ead;">def </span><span style="color:#8fa1b3;">u8hex</span><span style="color:#c0c5ce;">(</span><span style="color:#bf616a;">s</span><span style="color:#c0c5ce;">, </span><span style="color:#bf616a;">pad</span><span style="color:#c0c5ce;">=</span><span style="color:#d08770;">False</span><span style="color:#c0c5ce;">):
+</span><span style="color:#c0c5ce;">    out = &#39;&#39;
+</span><span style="color:#c0c5ce;">    </span><span style="color:#b48ead;">for </span><span style="color:#c0c5ce;">ch </span><span style="color:#b48ead;">in </span><span style="color:#c0c5ce;">s:
+</span><span style="color:#c0c5ce;">        h = ch.</span><span style="color:#8fa1b3;">encode</span><span style="color:#c0c5ce;">(&#39;</span><span style="color:#a3be8c;">utf-8</span><span style="color:#c0c5ce;">&#39;).</span><span style="color:#8fa1b3;">hex</span><span style="color:#c0c5ce;">()
+</span><span style="color:#c0c5ce;">        </span><span style="color:#b48ead;">if </span><span style="color:#c0c5ce;">pad and </span><span style="color:#96b5b4;">len</span><span style="color:#c0c5ce;">(h) == </span><span style="color:#d08770;">2</span><span style="color:#c0c5ce;">:
+</span><span style="color:#c0c5ce;">            h = &#39;</span><span style="color:#a3be8c;">00</span><span style="color:#c0c5ce;">&#39; + h
+</span><span style="color:#c0c5ce;">        out += h
+</span><span style="color:#c0c5ce;">    </span><span style="color:#b48ead;">return </span><span style="color:#c0c5ce;">out
+</span><span style="color:#c0c5ce;">
+</span><span style="color:#b48ead;">def </span><span style="color:#8fa1b3;">derive_key</span><span style="color:#c0c5ce;">(</span><span style="color:#bf616a;">seed_str</span><span style="color:#c0c5ce;">):
+</span><span style="color:#c0c5ce;">    </span><span style="color:#b48ead;">return </span><span style="color:#8fa1b3;">u8hex</span><span style="color:#c0c5ce;">(&#39;</span><span style="color:#a3be8c;">11111</span><span style="color:#c0c5ce;">&#39; + seed_str[:</span><span style="color:#d08770;">22</span><span style="color:#c0c5ce;">]).</span><span style="color:#8fa1b3;">encode</span><span style="color:#c0c5ce;">()[:</span><span style="color:#d08770;">32</span><span style="color:#c0c5ce;">]
+</span><span style="color:#c0c5ce;">
+</span><span style="color:#b48ead;">def </span><span style="color:#8fa1b3;">decrypt_drm_info</span><span style="color:#c0c5ce;">(</span><span style="color:#bf616a;">b64_blob</span><span style="color:#c0c5ce;">, </span><span style="color:#bf616a;">phone</span><span style="color:#c0c5ce;">, </span><span style="color:#bf616a;">name</span><span style="color:#c0c5ce;">):
+</span><span style="color:#c0c5ce;">    ct = base64.</span><span style="color:#8fa1b3;">b64decode</span><span style="color:#c0c5ce;">(b64_blob)
+</span><span style="color:#c0c5ce;">    key = </span><span style="color:#8fa1b3;">derive_key</span><span style="color:#c0c5ce;">(phone)
+</span><span style="color:#c0c5ce;">    iv  = </span><span style="color:#8fa1b3;">u8hex</span><span style="color:#c0c5ce;">(name[:</span><span style="color:#d08770;">8</span><span style="color:#c0c5ce;">], </span><span style="color:#bf616a;">pad</span><span style="color:#c0c5ce;">=</span><span style="color:#d08770;">True</span><span style="color:#c0c5ce;">).</span><span style="color:#8fa1b3;">encode</span><span style="color:#c0c5ce;">()[:</span><span style="color:#d08770;">16</span><span style="color:#c0c5ce;">]
+</span><span style="color:#c0c5ce;">    p = AES.</span><span style="color:#8fa1b3;">new</span><span style="color:#c0c5ce;">(key, </span><span style="color:#bf616a;">AES</span><span style="color:#c0c5ce;">.</span><span style="color:#bf616a;">MODE_CBC</span><span style="color:#c0c5ce;">, iv).</span><span style="color:#8fa1b3;">decrypt</span><span style="color:#c0c5ce;">(ct)
+</span><span style="color:#c0c5ce;">    n = p[-</span><span style="color:#d08770;">1</span><span style="color:#c0c5ce;">]
+</span><span style="color:#c0c5ce;">    </span><span style="color:#b48ead;">if </span><span style="color:#d08770;">1 </span><span style="color:#c0c5ce;">&lt;= n &lt;= </span><span style="color:#d08770;">16 </span><span style="color:#c0c5ce;">and p[-n:] == bytes([n]) * n:
+</span><span style="color:#c0c5ce;">        p = p[:-n]
+</span><span style="color:#c0c5ce;">    </span><span style="color:#b48ead;">return </span><span style="color:#c0c5ce;">json.</span><span style="color:#8fa1b3;">loads</span><span style="color:#c0c5ce;">(p.</span><span style="color:#8fa1b3;">decode</span><span style="color:#c0c5ce;">(&#39;</span><span style="color:#a3be8c;">utf-8</span><span style="color:#c0c5ce;">&#39;))
+</span><span style="color:#c0c5ce;">
+</span><span style="color:#c0c5ce;">drm = </span><span style="color:#8fa1b3;">decrypt_drm_info</span><span style="color:#c0c5ce;">(
+</span><span style="color:#c0c5ce;">    &quot;</span><span style="color:#a3be8c;">4LQb/8gjnDPE3D7fOtcxOH+DlMcgNWp8rTeAN4Mb6DauRp0O6DNlvpmQgWAWlg6GHM…</span><span style="color:#c0c5ce;">&quot;,
+</span><span style="color:#c0c5ce;">    &#39;</span><span style="color:#a3be8c;">[REDACTED]</span><span style="color:#c0c5ce;">&#39;, &#39;</span><span style="color:#a3be8c;">علیرضا آهنی</span><span style="color:#c0c5ce;">&#39;)
+</span><span style="color:#65737e;"># → {&#39;key&#39;: &#39;08347a70-80ea-4c01-b0cc-4b7f08994312&#39;,
+</span><span style="color:#65737e;">#    &#39;iv&#39;:  &#39;570aeeae-e960-4a7a-b779-efc30efd793a&#39;}
+</span></code></pre>
+<p>Note that Persian characters in the name produce multi-byte UTF-8 sequences handled naturally by <code>u8hex(pad=True)</code>.</p>
+<h4>Step 3 - Decrypt backup_<bookId>.time</h4>
+<pre style="background-color:#2b303b;">
+<code><span style="color:#b48ead;">def </span><span style="color:#8fa1b3;">decrypt_backup</span><span style="color:#c0c5ce;">(</span><span style="color:#bf616a;">path</span><span style="color:#c0c5ce;">, </span><span style="color:#bf616a;">drm_json</span><span style="color:#c0c5ce;">):
+</span><span style="color:#c0c5ce;">    raw = </span><span style="color:#96b5b4;">open</span><span style="color:#c0c5ce;">(path, &#39;</span><span style="color:#a3be8c;">rb</span><span style="color:#c0c5ce;">&#39;).</span><span style="color:#8fa1b3;">read</span><span style="color:#c0c5ce;">()
+</span><span style="color:#c0c5ce;">    key = </span><span style="color:#8fa1b3;">derive_key</span><span style="color:#c0c5ce;">(drm_json[&#39;</span><span style="color:#a3be8c;">key</span><span style="color:#c0c5ce;">&#39;])                      </span><span style="color:#65737e;"># &#39;11111&#39;+uuid[:22]
+</span><span style="color:#c0c5ce;">    iv  = </span><span style="color:#8fa1b3;">u8hex</span><span style="color:#c0c5ce;">(drm_json[&#39;</span><span style="color:#a3be8c;">iv</span><span style="color:#c0c5ce;">&#39;][:</span><span style="color:#d08770;">8</span><span style="color:#c0c5ce;">], </span><span style="color:#bf616a;">pad</span><span style="color:#c0c5ce;">=</span><span style="color:#d08770;">True</span><span style="color:#c0c5ce;">).</span><span style="color:#8fa1b3;">encode</span><span style="color:#c0c5ce;">()[:</span><span style="color:#d08770;">16</span><span style="color:#c0c5ce;">]
+</span><span style="color:#c0c5ce;">    p = AES.</span><span style="color:#8fa1b3;">new</span><span style="color:#c0c5ce;">(key, </span><span style="color:#bf616a;">AES</span><span style="color:#c0c5ce;">.</span><span style="color:#bf616a;">MODE_CBC</span><span style="color:#c0c5ce;">, iv).</span><span style="color:#8fa1b3;">decrypt</span><span style="color:#c0c5ce;">(raw)
+</span><span style="color:#c0c5ce;">    n = p[-</span><span style="color:#d08770;">1</span><span style="color:#c0c5ce;">]
+</span><span style="color:#c0c5ce;">    </span><span style="color:#b48ead;">return </span><span style="color:#c0c5ce;">p[:-n]                                          </span><span style="color:#65737e;"># strip PKCS7
+</span></code></pre>
+<p>Each file is 48 bytes: one AES block (16 B) of payload plus one block of pure PKCS7 padding (16 × <code>\x10</code>). The plaintext is exactly 32 chars.</p>
+<p>Results from the test machine:</p>
+<pre style="background-color:#2b303b;">
+<code><span style="color:#c0c5ce;">book 1060: rTBRPDocEN8BZxC6r%ey2@wV%drfaJDn
+</span><span style="color:#c0c5ce;">book 1221: Kp%sTnuE8cJ9%3pfHks%TPk6oD4EtfdJ
+</span><span style="color:#c0c5ce;">book 1222: r*7!84D&amp;o3^ZLr3v8w@Eke@g^cC3WRvZ
+</span><span style="color:#c0c5ce;">book 1233: 8az4a^w%w8iQg&amp;u49DejXA#wfaCMk7yM
+</span><span style="color:#c0c5ce;">book 1235: t79!tApbPZG7aJw9qS&amp;tEMt5G^PUa9rk
+</span><span style="color:#c0c5ce;">book 1279: LiMc&amp;iq2Z@k2zDBgHaP33!stnw%o7JDp
+</span><span style="color:#c0c5ce;">book 1539: Kp%sTnuE8cJ9%3pfHks%TPk6oD4EtfdJ   ← identical to 1221
+</span><span style="color:#c0c5ce;">book 422:  c3hzGDhv!H2TmjGB$SmWnFZhUW#V4wNA
+</span></code></pre>
+<p>(1221 &amp; 1539 sharing a password suggests same underlying content or same license group.)</p>
+<h4>Step 4 - Open the PDF</h4>
+<pre style="background-color:#2b303b;">
+<code><span style="color:#8fa1b3;">$</span><span style="color:#c0c5ce;"> qpdf</span><span style="color:#bf616a;"> --show-encryption --password</span><span style="color:#c0c5ce;">=&#39;</span><span style="color:#a3be8c;">rTBRPDocEN8BZxC6r%ey2@wV%drfaJDn</span><span style="color:#c0c5ce;">&#39; \
+</span><span style="color:#c0c5ce;">      attachment_1060_681c5e30ed5482472fb9d3ff.pdf
+</span><span style="color:#8fa1b3;">R</span><span style="color:#c0c5ce;"> = 5
+</span><span style="color:#8fa1b3;">P</span><span style="color:#c0c5ce;"> =</span><span style="color:#bf616a;"> -3904
+</span><span style="color:#8fa1b3;">User</span><span style="color:#c0c5ce;"> password = rTBRPDocEN8BZxC6r%</span><span style="color:#bf616a;">ey2</span><span style="color:#c0c5ce;">@wV%</span><span style="color:#bf616a;">drfaJDn
+</span><span style="color:#8fa1b3;">Supplied</span><span style="color:#c0c5ce;"> password is user password
+</span><span style="color:#8fa1b3;">extract</span><span style="color:#c0c5ce;"> for accessibility: not allowed
+</span><span style="color:#8fa1b3;">...
+</span><span style="color:#c0c5ce;">
+</span><span style="color:#8fa1b3;">$</span><span style="color:#c0c5ce;"> qpdf</span><span style="color:#bf616a;"> --decrypt --password</span><span style="color:#c0c5ce;">=&#39;</span><span style="color:#a3be8c;">rTBRPDocEN8BZxC6r%ey2@wV%drfaJDn</span><span style="color:#c0c5ce;">&#39; \
+</span><span style="color:#c0c5ce;">      attachment_1060_681c5e30ed5482472fb9d3ff.pdf decrypted_1060.pdf
+</span><span style="color:#8fa1b3;">operation</span><span style="color:#c0c5ce;"> succeeded with warnings; </span><span style="color:#8fa1b3;">resulting</span><span style="color:#c0c5ce;"> file may have some problems
+</span><span style="color:#c0c5ce;">
+</span><span style="color:#8fa1b3;">$</span><span style="color:#c0c5ce;"> qpdf</span><span style="color:#bf616a;"> --check</span><span style="color:#c0c5ce;"> decrypted_1060.pdf
+</span><span style="color:#8fa1b3;">PDF</span><span style="color:#c0c5ce;"> Version: 1.7
+</span><span style="color:#8fa1b3;">File</span><span style="color:#c0c5ce;"> is not encrypted
+</span><span style="color:#8fa1b3;">✓
+</span></code></pre>
+<p>14 MB output file, fully readable.</p>
+<h3>Filesystem layout on Windows</h3>
+<p>Located via:</p>
+<pre style="background-color:#2b303b;">
+<code><span style="color:#8fa1b3;">$</span><span style="color:#c0c5ce;"> fdfind &quot;</span><span style="color:#a3be8c;">com.vnegar</span><span style="color:#c0c5ce;">&quot;
+</span><span style="color:#8fa1b3;">AppData/Roaming/com.vnegar/
+</span><span style="color:#8fa1b3;">AppData/Local/Packages/com.vnegar.digimaze.reader_0qn9w5rgp5tx0/
+</span><span style="color:#8fa1b3;">AppData/Local/Microsoft/WindowsApps/com.vnegar.digimaze.reader_0qn9w5rgp5tx0/
+</span><span style="color:#c0c5ce;">
+</span><span style="color:#8fa1b3;">$</span><span style="color:#c0c5ce;"> fdfind &quot;</span><span style="color:#a3be8c;">database.db</span><span style="color:#c0c5ce;">&quot;
+</span><span style="color:#c0c5ce;">(</span><span style="color:#8fa1b3;">nothing</span><span style="color:#c0c5ce;"> relevant under com.vnegar)
+</span><span style="color:#c0c5ce;">
+</span><span style="color:#8fa1b3;">$</span><span style="color:#c0c5ce;"> fdfind &quot;</span><span style="color:#a3be8c;">uMUcLeML9ab</span><span style="color:#c0c5ce;">&quot;
+</span><span style="color:#c0c5ce;">(</span><span style="color:#8fa1b3;">none</span><span style="color:#c0c5ce;">)
+</span><span style="color:#8fa1b3;">$</span><span style="color:#c0c5ce;"> fdfind &quot;</span><span style="color:#a3be8c;">xQoqbsXxix</span><span style="color:#c0c5ce;">&quot;
+</span><span style="color:#c0c5ce;">(</span><span style="color:#8fa1b3;">none</span><span style="color:#c0c5ce;">)
+</span></code></pre>
+<p>Everything important lives under <code>AppData\Roaming\com.vnegar\digimaze\</code>:</p>
+<pre style="background-color:#2b303b;">
+<code><span style="color:#c0c5ce;">.db/database.db                                    SQLite 3.x, user version 21
+</span><span style="color:#c0c5ce;">attachment_1060_681c5e30ed5482472fb9d3ff           14.1M  raw download
+</span><span style="color:#c0c5ce;">attachment_1060_681c5e30ed5482472fb9d3ff.pdf       14.1M  outer-decrypted, still PDF-encrypted
+</span><span style="color:#c0c5ce;">backup_1060.time                                   48B    ← our target
+</span><span style="color:#c0c5ce;">backup_1221.time                                   48B
+</span><span style="color:#c0c5ce;">...
+</span><span style="color:#c0c5ce;">backup_422.time                                    48B
+</span><span style="color:#c0c5ce;">flutter_secure_storage.dat                         390B   DPAPI blob
+</span><span style="color:#c0c5ce;">shared_preferences.json                            32.9K  cleartext prefs
+</span><span style="color:#c0c5ce;">sqlite3.dll                                        2.1M   bundled sqlite
+</span></code></pre>
+<p>SQLite schema inspection:</p>
+<pre style="background-color:#2b303b;">
+<code><span style="color:#8fa1b3;">$</span><span style="color:#c0c5ce;"> sqlite3 .db/database.db &quot;</span><span style="color:#a3be8c;">.tables</span><span style="color:#c0c5ce;">&quot;
+</span><span style="color:#8fa1b3;">annotations_actions</span><span style="color:#c0c5ce;">        download_manager
+</span><span style="color:#8fa1b3;">attachment_download_log</span><span style="color:#c0c5ce;">    last_active_time
+</span><span style="color:#8fa1b3;">audio_chapters</span><span style="color:#c0c5ce;">             last_watched_video_second
+</span><span style="color:#8fa1b3;">book_attachment_types</span><span style="color:#c0c5ce;">      library
+</span><span style="color:#8fa1b3;">book_attachments</span><span style="color:#c0c5ce;">           shelf_table
+</span><span style="color:#8fa1b3;">book_download_log</span><span style="color:#c0c5ce;">          upload_manager
+</span><span style="color:#8fa1b3;">book_sync_md5</span><span style="color:#c0c5ce;">              usage_time
+</span><span style="color:#c0c5ce;">
+</span><span style="color:#8fa1b3;">$</span><span style="color:#c0c5ce;"> sqlite3 .db/database.db &quot;</span><span style="color:#a3be8c;">.schema book_attachments</span><span style="color:#c0c5ce;">&quot;
+</span><span style="color:#8fa1b3;">CREATE</span><span style="color:#c0c5ce;"> TABLE book_attachments (id TEXT NOT NULL, title TEXT, description TEXT,
+</span><span style="color:#c0c5ce;">  </span><span style="color:#8fa1b3;">fileName</span><span style="color:#c0c5ce;"> TEXT, fileSize INTEGER, bookId INTEGER, typeId INTEGER, sort INTEGER,
+</span><span style="color:#c0c5ce;">  </span><span style="color:#8fa1b3;">fileType</span><span style="color:#c0c5ce;"> TEXT);
+</span></code></pre>
+<p><code>shared_preferences.json</code> notable keys (cleartext):</p>
+<pre style="background-color:#2b303b;">
+<code><span style="color:#c0c5ce;">&quot;</span><span style="color:#a3be8c;">flutter.auth_token_v2</span><span style="color:#c0c5ce;">&quot;:   &quot;</span><span style="color:#a3be8c;">eyJhbG...wNzg</span><span style="color:#c0c5ce;">&quot;,   ← JWT access token, UNENCRYPTED
+</span><span style="color:#c0c5ce;">&quot;</span><span style="color:#a3be8c;">flutter.refresh_token_v2</span><span style="color:#c0c5ce;">&quot;:&quot;</span><span style="color:#a3be8c;">eyJhbG...wNzg</span><span style="color:#c0c5ce;">&quot;,
+</span><span style="color:#c0c5ce;">&quot;</span><span style="color:#a3be8c;">flutter.user_v2</span><span style="color:#c0c5ce;">&quot;:         &quot;</span><span style="color:#a3be8c;">{</span><span style="color:#96b5b4;">\&quot;</span><span style="color:#a3be8c;">id</span><span style="color:#96b5b4;">\&quot;</span><span style="color:#a3be8c;">:334934,</span><span style="color:#96b5b4;">\&quot;</span><span style="color:#a3be8c;">phone</span><span style="color:#96b5b4;">\&quot;</span><span style="color:#a3be8c;">:</span><span style="color:#96b5b4;">\&quot;</span><span style="color:#a3be8c;">[REDACTED]</span><span style="color:#96b5b4;">\&quot;</span><span style="color:#a3be8c;">,…}</span><span style="color:#c0c5ce;">&quot;,
+</span><span style="color:#c0c5ce;">&quot;</span><span style="color:#a3be8c;">flutter.ANDROID_VERSION</span><span style="color:#c0c5ce;">&quot;: &quot;</span><span style="color:#a3be8c;">2.21.1</span><span style="color:#c0c5ce;">&quot;,
+</span><span style="color:#c0c5ce;">&quot;</span><span style="color:#a3be8c;">flutter.WINDOWS_VERSION</span><span style="color:#c0c5ce;">&quot;: &quot;</span><span style="color:#a3be8c;">2.21.1</span><span style="color:#c0c5ce;">&quot;,
+</span><span style="color:#c0c5ce;">…
+</span></code></pre>
+<p>Absent despite being in the code: no <code>.tostore_data</code> directory, no <code>uMUcLeML9ab</code> folder, no <code>xQoqbsXxix</code>. On Windows the build apparently routes KV storage through <code>flutter_secure_storage</code> instead of ToStore's own file format. Worth verifying if you specifically care about ToStore internals.</p>
+<p>UWP sandbox dirs exist but are empty of interest:</p>
+<pre style="background-color:#2b303b;">
+<code><span style="color:#c0c5ce;">AppData/Local/Packages/com.vnegar.digimaze.reader_0qn9w5rgp5tx0/{LocalState,LocalCache,…}
+</span></code></pre>
+<p>Android equivalents (inferred from code, not tested live):</p>
+<ul>
+<li><code>/data/data/com.vnegar.digimaze.reader/databases/database.db</code></li>
+<li><code>/data/data/com.vnegar.digimaze.reader/files/.tostore_data/uMUcLeML9ab/</code></li>
+<li><code>shared_prefs/</code> XML files instead of <code>shared_preferences.json</code></li>
+</ul>
+<h3>The final script</h3>
+<p>A single self-contained file: <code>digimaze_drm.py</code>. The full source is in the repo; key excerpts are above. Usage:</p>
+<pre style="background-color:#2b303b;">
+<code><span style="color:#65737e;"># On Windows, as the user who ran the app (auto-DPAPI):
+</span><span style="color:#8fa1b3;">python</span><span style="color:#c0c5ce;"> digimaze_drm.py &quot;</span><span style="color:#a3be8c;">%APPDATA%\com.vnegar\digimaze</span><span style="color:#c0c5ce;">&quot;
+</span><span style="color:#c0c5ce;">
+</span><span style="color:#65737e;"># On Linux/macOS, after manually decrypting the .dat:
+</span><span style="color:#8fa1b3;">python3</span><span style="color:#c0c5ce;"> digimaze_drm.py</span><span style="color:#bf616a;"> --drm</span><span style="color:#c0c5ce;"> drm.json &lt;appdata_dir&gt;
+</span><span style="color:#c0c5ce;">
+</span><span style="color:#65737e;"># Decrypt a specific PDF with a recovered password:
+</span><span style="color:#8fa1b3;">python3</span><span style="color:#c0c5ce;"> digimaze_drm.py</span><span style="color:#bf616a;"> --pdf</span><span style="color:#c0c5ce;"> attachment_1060_….pdf &#39;</span><span style="color:#a3be8c;">rTBRPDocEN8BZxC6r%ey2@wV%drfaJDn</span><span style="color:#c0c5ce;">&#39; out.pdf
+</span></code></pre>
+<h3>Security assessment</h3>
+<p>Weaknesses observed, ranked by impact:</p>
+<ol>
+<li>
+<p><strong>Per-book PDF password is stored client-side in recoverable form.</strong> Anyone with local access (or the user's own credentials) can extract it. No hardware-backed keystore involvement. The DPAPI wrapper only helps against <em>other</em> users on the same machine, not against the owner.</p>
+</li>
+<li>
+<p><strong>Key derivation uses weak entropy</strong>: <code>&quot;11111&quot;</code> literal salt plus the user's own phone number. Both are guessable/leakable (phone numbers leak constantly). An attacker who knows a target's phone number can derive the DRM key given any single <code>backup_*.time</code> file.</p>
+</li>
+<li>
+<p><strong>IV reuse across books</strong>: the same <code>{key, iv}</code> pair decrypts every <code>backup_*.time</code> for a given user. Compromise once, read all. Also, IVs are deterministic (derived from GUID prefix), not random per encryption.</p>
+</li>
+<li>
+<p><strong>Auth tokens in cleartext JSON</strong>: <code>auth_token_v2</code> and <code>refresh_token_v2</code> sit unencrypted next to everything else. Malware or a curious roommate can steal the session.</p>
+</li>
+<li>
+<p><strong>Standard PDF encryption only</strong> (AESV3, R=5): once you have the password, any standards-compliant tool opens the file. No custom crypto on content. Owner-level restrictions (no-print/no-copy) are enforced by reader policy only, trivially bypassable with <code>qpdf --decrypt</code>.</p>
+</li>
+<li>
+<p><strong>Obfuscation ≠ encryption</strong>: <code>PositionObfuscator</code> and the XOR-8 tables are trivially reversible and provide zero resistance against a determined analyst.</p>
+</li>
+</ol>
+<p>What they do right:</p>
+<ul>
+<li>Platform DPAPI for the secure-storage blob (keeps other local users out)</li>
+<li>AES-256-CBC with PKCS7 instead of something homebrew</li>
+<li>Per-book passwords distinct rather than global</li>
+<li>Root/debugger detection present (though bypassable)</li>
+</ul>
+<h3>Appendix A - Key addresses (arm64 libapp.so, Flutter 3.44.4 build)</h3>
+<table><thead><tr><th>Symbol / role</th><th>Address</th></tr></thead><tbody>
+<tr><td><code>Encryption::decryptText</code></td><td><code>0xca6a84</code></td></tr>
+<tr><td><code>Encryption::encryptText</code></td><td><code>0xcd3118</code></td></tr>
+<tr><td><code>Encryption::decryptBinaryText</code></td><td><code>0xca9b2c</code></td></tr>
+<tr><td><code>Encryption::decryptFile</code></td><td><code>0xd27a54</code></td></tr>
+<tr><td><code>Encryption::utf8ToHex</code></td><td><code>0xca8f68</code></td></tr>
+<tr><td><code>BasePdfReaderUtils::getPasswordKey</code></td><td><code>0xcd5b74</code></td></tr>
+<tr><td><code>BasePdfReaderUtils::encryptObfuscatedParams</code></td><td><code>0xcd4ff8</code></td></tr>
+<tr><td><code>BasePdfReaderUtils::generateRandomString</code></td><td><code>0xcd5a34</code></td></tr>
+<tr><td><code>PositionObfuscator::obfuscate</code></td><td><code>0xcd540c</code></td></tr>
+<tr><td><code>PositionObfuscator::_permutation</code></td><td><code>0xcd55fc</code></td></tr>
+<tr><td><code>PositionObfuscator::_seedFromKeyAndLength</code></td><td><code>0xcd585c</code></td></tr>
+<tr><td><code>PositionObfuscator::_toCodePoints</code></td><td><code>0xcd59e8</code></td></tr>
+<tr><td><code>BookRepository::getBookPassword</code></td><td><code>0xca604c</code></td></tr>
+<tr><td><code>BookRepository::_fetchBookPrivateInfo</code></td><td><code>0xcd836c</code></td></tr>
+<tr><td><code>BookRepository::downloadBookAttachment</code></td><td><code>0xd2656c</code></td></tr>
+<tr><td><code>StorageRepository::getUserDrm</code></td><td><code>0xca6478</code></td></tr>
+<tr><td><code>StorageRepository::getBookLic</code></td><td><code>0xcaa56c</code></td></tr>
+<tr><td><code>LocalPref::getUserDrmInfo</code></td><td><code>0xca69f0</code></td></tr>
+<tr><td><code>LocalPref::setUserDrmInfo</code></td><td><code>0x913f68</code></td></tr>
+<tr><td><code>LocalPref::hasBookEncryptedPassword</code></td><td><code>0xca991c</code></td></tr>
+<tr><td><code>LocalPref::getBookEncryptedPassword</code></td><td><code>0xca942c</code></td></tr>
+<tr><td><code>LocalPref::setBookEncryptedPassword</code></td><td><code>0xca9f04</code></td></tr>
+<tr><td><code>Downloader::downloadBookFileConfig</code></td><td><code>0xca94dc</code></td></tr>
+<tr><td><code>AdvancedPdfReaderUtils::_prepareSecureParams</code></td><td><code>0xca9ff0</code></td></tr>
+<tr><td><code>_StorageServiceClient::getUserDrm</code></td><td><code>0x914000</code></td></tr>
+<tr><td><code>_StorageServiceClient::getBookPrivateInfo</code></td><td><code>0xcd8504</code></td></tr>
+<tr><td>Legacy open-channel</td><td>MethodChannel <code>&quot;open&quot;</code>, keys <code>{path, bookId, password}</code></td></tr>
+<tr><td>Advanced open-channel</td><td>MethodChannel <code>&quot;openBook&quot;</code>, keys <code>{path, params}</code></td></tr>
+<tr><td>getFileContentUri channel</td><td><code>&quot;getFileContentUri&quot;</code></td></tr>
+<tr><td>Backup URL pattern</td><td><code>GET {BASE_URL}/storage/v3/books/{bookId}/file/backup</code></td></tr>
+<tr><td>DRM info URL</td><td><code>GET {BASE_URL}/v2/user/books/info</code></td></tr>
+<tr><td>Private info URL</td><td><code>GET {BASE_URL}/v1/books/{bookId}/info</code></td></tr>
+</tbody></table>
+<h3>Appendix B - Object-pool constants worth grepping for</h3>
+<p>Constant pool entries that jump out when scanning blutter output:</p>
+<table><thead><tr><th>Constant</th><th>Meaning</th><th>Pool addr</th></tr></thead><tbody>
+<tr><td><code>&quot;11111&quot;</code></td><td>Universal key-derivation salt</td><td><code>pp+0x183d0</code></td></tr>
+<tr><td><code>&quot;uMUcLeML9ab&quot;</code></td><td>ToStore dbPath component</td><td><code>pp+0x31328</code></td></tr>
+<tr><td><code>&quot;xQoqbsXxix&quot;</code></td><td>ToStore dbPath config name</td><td><code>pp+0x31330</code></td></tr>
+<tr><td><code>&quot;havePadding&quot;</code></td><td>Named arg marker for utf8ToHex</td><td><code>pp+0x184c0</code></td></tr>
+<tr><td><code>&quot;Bearer &quot;</code></td><td>Auth header prefix</td><td><code>pp+0x19c30</code></td></tr>
+<tr><td><code>&quot;Cant decrypt password file =&gt; DeleteFile&quot;</code></td><td>Failure breadcrumb</td><td><code>pp+0x183c0</code></td></tr>
+<tr><td><code>&quot;/database.db&quot;</code></td><td>Main SQLite filename</td><td><code>pp+0x1c6e8</code></td></tr>
+<tr><td><code>&quot;user_drm_info&quot;</code></td><td>KvStore key</td><td><code>pp+0x185c8</code></td></tr>
+<tr><td><code>&quot;auth_token_v2&quot;</code></td><td>KvStore key</td><td><code>pp+0x19c18</code></td></tr>
+<tr><td><code>&quot;book_&quot;</code> / <code>&quot;_backup&quot;</code></td><td>KvStore key parts for per-book pw cache</td><td><code>pp+0x18360</code> / <code>pp+0x18368</code></td></tr>
+<tr><td><code>&quot;.tostore_data&quot;</code></td><td>ToStore directory name</td><td><code>pp+0x35c88</code></td></tr>
+<tr><td><code>&quot;/storage/v3/books/&quot;</code></td><td>Backup download path</td><td><code>pp+0x19ba0</code></td></tr>
+<tr><td><code>&quot;/file/backup&quot;</code></td><td>Backup download suffix</td><td><code>pp+0x19ba8</code></td></tr>
+<tr><td><code>&quot;/v2/user/books/info&quot;</code></td><td>DRM info endpoint</td><td><code>pp+0x19b58</code></td></tr>
+<tr><td><code>&quot;Standard&quot;</code>, <code>&quot;V2&quot;</code>, <code>&quot;AESV2&quot;</code>, <code>&quot;AESV3&quot;</code></td><td>PDF cipher identifiers (native side)</td><td>-</td></tr>
+</tbody></table>
+<h3>Appendix C - What I did NOT do</h3>
+<ul>
+<li>Did not dump or reverse the Android Java/Kotlin side (mupdf JNI bridge). The Dart-side analysis made it unnecessary - all interesting logic is in Dart.</li>
+<li>Did not inspect <code>IDatabaseImpl::onUpgrade</code> migrations past noting their existence (code targets version 28; disk had version 21).</li>
+<li>Did not attempt to defeat the root/debugger checks in <code>Security::verifyAndroidDeviceSecurity</code> (wraps <code>security_plus</code> package). Irrelevant for offline extraction since the app was never run.</li>
+<li>Did not verify behaviour on iOS. The Dart code is cross-platform so the same chain should hold, but secure-storage backend differs (Keychain instead of DPAPI), so step 1 changes.</li>
+<li>Did not test whether the desktop Windows build (Flutter, non-UWP) stores things identically to the UWP build. Both were present; I analyzed the UWP one because that's where the files were.</li>
+<li>Did not attempt to write a Frida hook using <code>blutter_frida.js</code>. Static analysis sufficed.</li>
+</ul>
+<h3>Known limitations</h3>
+<ul>
+<li>Addresses are specific to the analyzed build (Flutter 3.44.4, app version 1.1.114.0 / 2.21.1). Any app update shifts them.</li>
+<li>The <code>PositionObfuscator</code> reconstruction was verified by round-trip only, not against a live capture of actual obfuscated traffic between Dart and native. If the native side uses a slightly different permutation direction, the reconstruction may need sign flips. Doesn't affect password recovery.</li>
+<li>Android paths are inferred from Dart code (<code>path_provider</code> conventions) and not confirmed by pulling files from a live device.</li>
+</ul>
+
+      </article>
+    </main>
+    <footer>
+      <p>Updated at: 2026/08/24 21:43:06</p>
+    </footer>
+  </body>
+</html>
