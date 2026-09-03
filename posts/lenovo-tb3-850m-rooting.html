@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<meta charset="utf-8">
+<title>Alireza's blog :: Rooting Lenovo TB3-850M (Tab 3 8" LTE)</title>
+<link rel="stylesheet" href="https://neat.joeldare.com/neat.css">
+<link rel="stylesheet" href="/public/css/styles.css">
+<link rel="alternate" type="application/rss+xml" title="RSS Feed for Alireza's blog" href="https://alirezaahani.github.io/rss.xml" />
+
+    <meta name="description" content="Steps to rooting an old Lenovo tablet with an MTK SoC using mtkclient and Magisk">
+    <meta name="category" content="Android, Magisk">
+  </head>
+  <body>
+    <header>
+      <h1>Alireza's blog</h1>
+<nav>
+    <a href="/">Index</a>
+    <a href="/pages/about.html">About</a>
+    <a href="https://github.com/alirezaahani">Github</a>
+    <a href="/rss.xml">RSS</a>
+</nav>
+
+    </header>
+    <main>
+      <article>
+        <div>  
+          <h2>Rooting Lenovo TB3-850M (Tab 3 8" LTE)</h2>
+          <time pubdate="pubdate">Published at: 2026/09/03 23:30:00</time>
+          <span>- Category: Android, Magisk</span> 
+        </div>
+        <p>Steps to rooting an old Lenovo tablet with an MTK SoC using mtkclient and Magisk</p>
+        <p class="notice" style="color: red">
+Attention: You are responsible for any damages to your device, read the article with CARE and replicate it after FULLY reading it.
+</p>
+
+This time the device is a Lenovo Tab 3 8" LTE (model `TB3-850M`, SoC `MT6735M`, Android 6.0).
+Unlike my previous post about the DRA-LX3, this tablet does **not** need the MTK Bypass exploit.
+Its BootROM has no serial-link protection, so `mtkclient` can talk to it directly.
+The whole process runs on Linux (I did it on my machine, no Windows involved).
+
+## Needed software and hardware
+- Your TB3-850M tablet
+- USB cable with data as well
+- A Linux machine (tested on Mint, I have not tested Windows)
+- Internet connection
+
+## Step 1: Gathering information
+First we need to know what we are dealing with. Enable developer mode on the tablet (tap `Build number` many times in `Settings -> About device`), enable `USB debugging`, connect the tablet, and run this:
+```bash
+adb shell getprop | grep -Ei 'ro.product|ro.build.fingerprint|ro.board.platform|ro.secure|ro.build.tags'
+```
+You should see something like this:
+```
+[ro.build.fingerprint]: [Lenovo/LenovoTB3-850M/TB3-850M:6.0/MRA58K/TB3-850M_S100036_171214_ROW:user/release-keys]
+[ro.board.platform]: [mt6735m]
+[ro.build.tags]: [release-keys]
+[ro.secure]: [1]
+```
+This tells us a few things:
+- The SoC is `mt6735m`, so `mtkclient` is the right tool.
+- `release-keys` and `ro.secure=1` mean this is a stock user build - `adb root` will **not** give us root, and this is normal, not a failure. We do not need it.
+- The build fingerprint (`S100036`) is useful later if we ever need the matching stock firmware.
+
+Also check the partition layout:
+```bash
+adb shell cat /proc/partitions
+adb shell 'for p in boot recovery system userdata cache; do readlink -f /dev/block/platform/mtk-msdc.0/11230000.msdc0/by-name/$p; done'
+```
+On my tablet the `boot` partition is `mmcblk0p7`, exactly 16 MiB (32768 sectors).
+**Back up your tablet data** to your machine, because Step 4 will wipe everything.
+
+## Step 2: Installing mtkclient
+We need [mtkclient](https://github.com/bkerler/mtkclient), a tool that talks directly to the MTK BootROM / Preloader (BROM mode), let's us read and write any partition.
+First install [`uv`](https://docs.astral.sh/uv/):
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+Then clone `mtkclient` and create a virtual environment with it inside (notice that `mtkclient` is **not** on PyPI, you cannot `pip install` it):
+```bash
+git clone https://github.com/bkerler/mtkclient
+cd mtkclient
+uv sync
+```
+Now the tool is run with this command from inside the `mtkclient` folder:
+```bash
+uv run mtk.py printgpt
+```
+If it says `Waiting for PreLoader VCOM`, the tablet is not in the right mode yet.
+
+### How to put the tablet in BROM mode
+1. Turn the tablet off completely.
+2. Hold down the <kbd>Volume down</kbd> with the <kbd>Power</kdb> button. Do these steps while holding it.
+3. Connect the USB cable.
+Now run `uv run mtk.py printgpt` again - if it prints the partition table, you are in.
+You will see a small screen on the tablet saying `Connecting to USB port... Downloading...`.
+
+## Step 3: Downloading the boot image
+```
+Now we download the device's original boot image. Put the tablet in BROM mode (see Step 2) and run this:
+```bash
+uv run mtk.py r boot boot.img
+```
+You should see a progress bar ending with something like:
+```
+DaHandler - Dumped sector 60416 with sector count 32768 as boot.img.
+```
+**Save this `boot.img` somewhere safe.** This file is the only thing standing between you and a bricked tablet - it is how you undo everything we do.
+
+## Step 4: Unlocking the bootloader
+This is the step I got wrong in the beginning, read it carefully.
+On this device, the Little Kernel (LK) bootloader **refuses to boot a modified boot image while locked** - it accepts the stock one, but loops (logo -> reboot -> logo) on anything else.
+So the bootloader **must** be unlocked before flashing a patched boot image, not after.
+
+Put the tablet in **Fastboot mode** (not BROM mode). On my tablet I used this from a running Android:
+```bash
+adb reboot bootloader
+```
+
+You should see `FASTBOOT mode` on the tablet's screen. Check from your machine:
+```bash
+fastboot devices
+fastboot getvar all | grep -iE 'unlocked|secure'
+```
+If it says `unlocked: no`, unlock it:
+```bash
+fastboot oem unlock
+```
+The tablet will show a warning screen: press <kbd>Volume up</kbd> to confirm.
+**This factory-resets the tablet.** This is why we backed up in Step 3.
+
+## Step 5: Patch the boot image
+Turn the tablet on and finish the setup wizard.
+When you reach the home screen, the factory reset wiped your settings, so re-enable `USB debugging` in `Settings -> Developer options`.
+```bash
+adb devices
+```
+Now install the [Magisk](https://github.com/topjohnwu/Magisk) app (I used v28.1, the current version might not work because how old this device is):
+```bash
+adb install Magisk-v28.1.apk
+```
+Then copy the original boot image we downloaded in Step 3 to the tablet:
+```bash
+adb push boot.img /sdcard/boot.img
+```
+Open the Magisk app, on the home page click on `Install`.
+Select the `Select and patch a file` method and pick `/sdcard/boot.img`.
+On this old device (Android 6.0) the `Preserve AVB 2.0/dm-verity` option is irrelevant - this tablet has no AVB at all - so leave the options as they are.
+Magisk will patch the image and save it as `magisk_patched-XXXXXXXX.img` inside the tablet.
+Copy it back to your machine:
+```bash
+adb pull /sdcard/magisk_patched-XXXXXXXX.img
+```
+I patch on the device itself on purpose: the Magisk app uses the correct `magiskboot` for the job, while the standalone `magiskboot` binary is no longer shipped inside the APK (only a `libmagiskboot.so` that does not have the `patch` command).
+
+## Step 6: Write the boot image
+Put the tablet in Fastboot mode again.
+Now flash the patched image:
+```bash
+fastboot flash boot magisk_patched-XXXXXXXX.img
+```
+You should see:
+```
+Sending 'boot' (16384 KB)                          OKAY [  1.627s]
+Writing 'boot'                                     OKAY [  0.545s]
+```
+Then reboot. On this device `fastboot reboot` fails with an error like `not support on security`, so just power off the tablet (hold <kbd>Power</kbd> for about 15 seconds) and turn it on again.
+
+## Step 7: Your device is now rooted!
+The first boot after all this takes a while (the tablet re-encrypts its data after the factory reset), let it sit for a few minutes.
+When it asks for setup, finish it and re-enable `USB debugging` again.
+Notice that the Magisk **app** was also deleted by the factory reset, so install it one more time (the root itself survives, it lives inside the boot image):
+```bash
+adb install Magisk-v28.1.apk
+```
+The app may ask you to reboot once more, let it.
+Now check that everything works:
+```bash
+adb shell su -c id
+```
+You should see:
+```
+uid=0(root) gid=0(root) groups=0(root) context=u:r:magisk:s0
+```
+Have fun messing around with your rooted Android tablet.
+
+## Recovery and unrooting
+Everything we changed is **one partition**: `boot`. Everything else on the tablet is untouched.
+
+### Unrooting (going back to stock)
+Put the tablet in BROM mode and flash the original boot image back:
+```bash
+uv run mtk.py w boot boot.img
+```
+Power cycle the tablet and it is back to stock. No wipes needed.
+
+### Unbricking (if the tablet does not boot at all)
+BROM mode still works even with a bootloop or a dead boot image, so this always works:
+1. Force the tablet off: hold <kbd>Power</kbd> and kbd>Volumn down</kbd> for 15 seconds (ignore the screen).
+2. Put it in BROM mode.
+3. Flash the stock boot image back:
+```bash
+uv run mtk.py w boot boot.img
+```
+4. Verify you wrote the right thing by reading it back and comparing the checksums:
+```bash
+uv run mtk.py r boot check.img
+sha1sum check.img boot.img
+# both lines must show the same hash
+```
+5. Power off (hold <kbd>Power</kbd> 15 seconds) and turn the tablet on normally.
+
+### Re-locking the bootloader
+If you ever want to lock the bootloader again: `adb reboot bootloader` then `fastboot oem lock`.
+Do this **only** after you removed root (Step "Unrooting" above), otherwise the tablet will not boot.
+
+## Mistakes I made along the way (so you don't repeat them)
+- **I flashed the patched boot image while the bootloader was still locked.** The tablet looped (logo -> reboot -> logo) and I had to recover it via BROM mode (see "Unbricking" above). The fix: unlock **first** (Step 4), flash **second** (Step 6).
+- **I used the wrong argument order for `mtk.py w`.** The order is `w <partition> <file>` (for example `w boot boot.img`), the same as `r`. I wrote `w boot.img boot` once and it silently did **nothing** - no error, no warning. This is why you must always verify a write by reading the partition back and comparing `sha1sum`, which I only learned to do after the write silently failed.
+- **I ran `uv run mtk.py reset`** to restart the tablet. It powered the tablet off, but it also poisons the mtkclient session: every next command failed with `Please disconnect, start mtkclient and reconnect`. The only fix is to physically unplug the USB cable and enter BROM mode again. I have not used `mtk.py reset` once since - just power-cycle the tablet by hand.
+- **I tried to install `mtkclient` with `uv pip install mtkclient`** and got "no solution found". It is not on PyPI, you must clone it from GitHub and run it from the source folder as shown in Step 2.
+- **I tried to use the `magiskboot` binary from the Magisk APK** to patch on my machine. The current APKs do not include a standalone `magiskboot` anymore, only `libmagiskboot.so`, and that one has no `patch` command. Patching from the app on the tablet (Step 5) is the way.
+- **After the factory reset, `adb devices` showed nothing** and I could not figure out why for a while. The reset wipes the developer settings, so `USB debugging` was off again. Finish the setup wizard and re-enable it before touching anything else.
+
+If you find any custom roms or any other interesting thing to do with this tablet, be sure to contact me.
+
+      </article>
+    </main>
+    <footer>
+      <p>Updated at: 2026/09/03 19:45:27</p>
+    </footer>
+  </body>
+</html>
