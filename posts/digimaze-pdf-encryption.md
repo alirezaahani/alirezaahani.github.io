@@ -1,5 +1,5 @@
 ---
-title: Digimaze pdf encryption 
+title: Digimaze PDF encryption 
 layout: posts.liquid
 is_draft: false
 published_date: 2025-05-26 23:42:00 +0330
